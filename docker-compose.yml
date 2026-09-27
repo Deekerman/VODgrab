@@ -1,0 +1,29 @@
+services:
+  vodgrab:
+    image: ghcr.io/deekerman/vodgrab:latest
+    build: .
+    container_name: vodgrab
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - PUID=1000        # match the user Sonarr and Radarr run as
+      - PGID=1000
+      - TZ=America/Toronto
+    volumes:
+      - ./data:/data                 # database, settings and backups
+      - /path/to/downloads:/downloads # mount at the same path in Sonarr and Radarr
+
+  # Sonarr and Radarr must see downloads at the same path VODgrab writes them
+  # (default base path /downloads/iptv). For example, in their services:
+  #
+  #   sonarr:
+  #     volumes:
+  #       - /path/to/downloads:/downloads
+  #   radarr:
+  #     volumes:
+  #       - /path/to/downloads:/downloads
+  #
+  # On the same compose network, use http://vodgrab:8765 as the indexer and
+  # download client host in Sonarr and Radarr, and http://sonarr:8989 /
+  # http://radarr:7878 in VODgrab's settings.
