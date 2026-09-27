@@ -1,16 +1,48 @@
+<div align="center">
+
 # VODgrab
 
-Download Xtream IPTV VOD as real video files for Sonarr and Radarr.
+**Turn your Xtream IPTV VOD library into real video files for Sonarr and Radarr.**
 
-VODgrab is a single Python file (standard library only) that serves:
+[![Docker image](https://github.com/Deekerman/VODgrab/actions/workflows/docker.yml/badge.svg)](https://github.com/Deekerman/VODgrab/actions/workflows/docker.yml)
+![Python](https://img.shields.io/badge/python-3.8%2B-3776ab?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Platforms](https://img.shields.io/badge/docker-amd64%20%7C%20arm64-2496ed?logo=docker&logoColor=white)
 
-- a **web UI** for providers, the catalog, the queue and settings
-- a **Newznab indexer** that Sonarr and Radarr search
-- a **SABnzbd-compatible API** that Sonarr and Radarr send downloads to
+![Browse](docs/screenshots/browse.png)
 
-`ffprobe` (from ffmpeg) is optional. VODgrab uses it to verify finished downloads, and the Docker image includes it.
+</div>
 
-## Docker Compose
+VODgrab sits between your IPTV provider and your *arr stack. Sonarr and Radarr see it as a normal **Newznab indexer** and **SABnzbd download client**. When they grab a release, VODgrab downloads the matching movie or episode from your provider, checks the file, and hands it back for import. You can also browse the whole catalog in VODgrab's own web UI and download from there.
+
+It is a single Python file with no dependencies outside the standard library.
+
+## Features
+
+- **Works with Sonarr and Radarr as they are.** It acts as a Newznab indexer and a SABnzbd API, with one-click setup that adds itself to both apps.
+- **Catalog browser.** Posters, ratings, quality badges, filters, search, and movie and series detail pages with per-episode downloads.
+- **Wanted list.** Shows what Sonarr and Radarr are missing that your provider has, and can search for it automatically.
+- **Multiple providers.** Set a priority order and connection limits. If a download fails on one provider, the next one is tried.
+- **Reliable downloads.** Resumes interrupted transfers, retries with backoff, has a speed limit, and checks files with ffprobe.
+- **Download schedule.** Only download during the time windows you set, with pause and resume.
+- **Metadata.** Optional TMDB, OMDb and TVDB keys add artwork, cast, age ratings and better matching.
+- **Unmatched review.** Fix titles VODgrab couldn't match yourself, and the fix is remembered.
+- **Backups.** Scheduled backups of settings, metadata and the catalog, with restore from the UI.
+- **Web login** and a SABnzbd-style API key.
+
+## Screenshots
+
+| Movie details | Series and episodes |
+| :---: | :---: |
+| ![Movie details](docs/screenshots/movie.png) | ![Series details](docs/screenshots/series.png) |
+| **Download queue** | **History** |
+| ![Queue](docs/screenshots/queue.png) | ![History](docs/screenshots/history.png) |
+| **Settings** | |
+| ![Settings](docs/screenshots/settings.png) | |
+
+<sub>Screenshots use a fake demo provider with made-up titles.</sub>
+
+## Quick start (Docker Compose)
 
 ```yaml
 services:
@@ -33,9 +65,9 @@ services:
 docker compose up -d
 ```
 
-Then open `http://<host>:8765`.
+Open **http://&lt;host&gt;:8765**, add your provider under **Settings → Providers**, and run a sync.
 
-To build the image yourself instead of pulling it, run `docker compose up -d --build` (the compose file in this repo has `build: .`).
+To build the image from source instead, clone this repo and run `docker compose up -d --build`.
 
 ### Volumes
 
@@ -44,7 +76,8 @@ To build the image yourself instead of pulling it, run `docker compose up -d --b
 | `/data` | Database, settings, metadata cache and backups. Keep this. |
 | `/downloads` | Downloads go to `/downloads/iptv` by default (the **Base path** setting). |
 
-**Sonarr and Radarr must see the downloads at the same path.** Mount the same host folder at `/downloads` in all three containers. Then no remote path mapping is needed, and imports work.
+> [!IMPORTANT]
+> **Sonarr and Radarr must see the downloads at the same path VODgrab does.** Mount the same host folder at `/downloads` in all three containers. Then no remote path mapping is needed, and imports work.
 
 ### Environment
 
@@ -56,14 +89,51 @@ To build the image yourself instead of pulling it, run `docker compose up -d --b
 
 On start, the container sets `/data` to be owned by `PUID:PGID`. If `/downloads/iptv` doesn't exist yet, it creates that folder too. Nothing else under `/downloads` is changed.
 
-### Connecting Sonarr and Radarr
+### Full stack example
 
-When everything runs on the same compose network:
+```yaml
+services:
+  vodgrab:
+    image: ghcr.io/deekerman/vodgrab:latest
+    restart: unless-stopped
+    ports: ["8765:8765"]
+    environment: [PUID=1000, PGID=1000, TZ=America/Toronto]
+    volumes:
+      - ./vodgrab:/data
+      - /srv/media/downloads:/downloads
 
-1. In VODgrab **Settings**, set the Sonarr URL to `http://sonarr:8989` and the Radarr URL to `http://radarr:7878`, and add their API keys.
-2. VODgrab can add itself to Sonarr and Radarr as an indexer and download client. To add them by hand, use host `vodgrab`, port `8765`, and the API key shown in VODgrab.
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    restart: unless-stopped
+    ports: ["8989:8989"]
+    environment: [PUID=1000, PGID=1000, TZ=America/Toronto]
+    volumes:
+      - ./sonarr:/config
+      - /srv/media/downloads:/downloads
+      - /srv/media/tv:/tv
 
-## Without Docker
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    restart: unless-stopped
+    ports: ["7878:7878"]
+    environment: [PUID=1000, PGID=1000, TZ=America/Toronto]
+    volumes:
+      - ./radarr:/config
+      - /srv/media/downloads:/downloads
+      - /srv/media/movies:/movies
+```
+
+## Connecting Sonarr and Radarr
+
+1. In VODgrab, open **Settings**. Enter the Sonarr URL (`http://sonarr:8989` on the same compose network) and its API key, and do the same for Radarr (`http://radarr:7878`).
+2. Press **Set up Sonarr automatically** and **Set up Radarr automatically**. This adds VODgrab to each app as an indexer, a download client, and an import webhook.
+3. Search in Sonarr or Radarr as usual. Releases from your provider have names ending in `.IPTV`, like `Movie.Name.2023.1080p.WEB-DL.IPTV`.
+
+To add VODgrab by hand instead: in Sonarr or Radarr, add a **Newznab** indexer and a **SABnzbd** download client, both with host `vodgrab`, port `8765`, and the API key shown in VODgrab's settings.
+
+## Running without Docker
+
+You need Python 3.8 or newer. Installing `ffmpeg` is recommended, for download checks.
 
 ```sh
 python3 vodgrab.py serve          # run the web UI, indexer and download API
@@ -72,3 +142,15 @@ python3 vodgrab.py sync           # run one catalog sync and exit
 ```
 
 Data is stored in `./data` next to the script, or in `$VODGRAB_DATA` if that's set.
+
+## Updating
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+Your settings and catalog live in `/data`, so updating keeps them.
+
+## Disclaimer
+
+VODgrab is a download tool for content you're entitled to access. It doesn't include or point to any provider or content. You're responsible for complying with your provider's terms and the laws where you live.
