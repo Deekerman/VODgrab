@@ -15,7 +15,7 @@
 
 VODgrab sits between your IPTV provider and your *arr stack. Sonarr and Radarr see it as a normal **Newznab indexer** and **SABnzbd download client**. When they grab a release, VODgrab downloads the matching movie or episode from your provider, checks the file, and hands it back for import. You can also browse the whole catalog in VODgrab's own web UI and download from there.
 
-It is a single Python file with no dependencies outside the standard library.
+It is a single Python file with no dependencies outside the standard library. Run it with [Docker Compose](#quick-start-docker-compose) or [just the Python file](#install-with-just-the-python-file).
 
 ## Features
 
@@ -131,19 +131,49 @@ services:
 
 To add VODgrab by hand instead: in Sonarr or Radarr, add a **Newznab** indexer and a **SABnzbd** download client, both with host `vodgrab`, port `8765`, and the API key shown in VODgrab's settings.
 
-## Running without Docker
+## Install with just the Python file
 
-You need Python 3.8 or newer. Installing `ffmpeg` is recommended, for download checks.
+VODgrab is one file with no dependencies, so you can skip Docker. You need Python 3.8 or newer. Installing `ffmpeg` is recommended, so downloads get checked with ffprobe.
 
 ```sh
-python3 vodgrab.py serve          # run the web UI, indexer and download API
-sudo python3 vodgrab.py install   # install and start a systemd service
-python3 vodgrab.py sync           # run one catalog sync and exit
+# 1. Get the script
+sudo mkdir -p /opt/vodgrab
+sudo curl -fsSL -o /opt/vodgrab/vodgrab.py \
+  https://raw.githubusercontent.com/Deekerman/VODgrab/main/vodgrab.py
+
+# 2. Optional but recommended: ffprobe for download checks
+sudo apt install ffmpeg        # Debian/Ubuntu; use your distro's package manager otherwise
+
+# 3. Install and start it as a systemd service
+sudo python3 /opt/vodgrab/vodgrab.py install
 ```
 
-Data is stored in `./data` next to the script, or in `$VODGRAB_DATA` if that's set.
+Open **http://&lt;host&gt;:8765**. The service starts at boot and restarts if it crashes.
 
-## Updating
+To try it without installing a service, run it in the foreground:
+
+```sh
+python3 vodgrab.py serve               # web UI, indexer and download API (Ctrl+C to stop)
+python3 vodgrab.py serve --port 9000   # on a different port
+python3 vodgrab.py sync                # run one catalog sync and exit
+```
+
+Data (database, settings, backups) is stored in a `data` folder next to the script, `/opt/vodgrab/data` in the example above. Set `VODGRAB_DATA` to store it somewhere else.
+
+**Updating:** download the file again over the old one, then restart:
+
+```sh
+sudo curl -fsSL -o /opt/vodgrab/vodgrab.py \
+  https://raw.githubusercontent.com/Deekerman/VODgrab/main/vodgrab.py
+sudo systemctl restart vodgrab
+```
+
+**Logs:** `journalctl -u vodgrab -f`
+
+> [!NOTE]
+> The service runs as root. Set **Owner for new files** (for example `1000:1000`) in VODgrab's settings so Sonarr and Radarr can move the downloaded files.
+
+## Updating (Docker)
 
 ```sh
 docker compose pull && docker compose up -d
