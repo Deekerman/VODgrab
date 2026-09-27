@@ -17,6 +17,8 @@ VODgrab sits between your IPTV provider and your *arr stack. Sonarr and Radarr s
 
 It is a single Python file with no dependencies outside the standard library. Run it with [Docker Compose](#quick-start-docker-compose) or [just the Python file](#install-with-just-the-python-file).
 
+It is VERY important to note, this was made entirely by AI.
+
 ## Features
 
 - **Works with Sonarr and Radarr as they are.** It acts as a Newznab indexer and a SABnzbd API, with one-click setup that adds itself to both apps.
