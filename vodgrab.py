@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -124,8 +124,11 @@ DEFAULTS = {
     "backup_catalog": True,
     "backup_path": "",
     "update_check": True,
+    "dispatcharr_url": "",
+    "dispatcharr_api_key": "",
 }
-SECRET_KEYS = ("sonarr_api_key", "radarr_api_key", "web_password", "tmdb_key", "omdb_key", "tvdb_key", "tvdb_pin")
+SECRET_KEYS = ("sonarr_api_key", "radarr_api_key", "web_password", "tmdb_key", "omdb_key", "tvdb_key", "tvdb_pin",
+               "dispatcharr_api_key")
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 
 # name: (settings key, default folder under base_path)
@@ -151,6 +154,7 @@ PROVIDERS = collections.OrderedDict()  # id -> dict, ordered by priority
 def mask(s):
     s = str(s)
     vals = [SETTINGS.get(k) for k in ("sonarr_api_key", "radarr_api_key", "tmdb_key", "omdb_key", "tvdb_key",
+                                      "dispatcharr_api_key",
                                       "tvdb_pin")]
     for p in list(PROVIDERS.values()):
         vals += [p.get("password"), p.get("username")]
@@ -255,6 +259,7 @@ CREATE TABLE IF NOT EXISTS providers(id INTEGER PRIMARY KEY AUTOINCREMENT, name 
 CREATE TABLE IF NOT EXISTS matches(arr TEXT, arr_id TEXT, xids TEXT, method TEXT, score REAL, title TEXT,
   year INTEGER, checked REAL, PRIMARY KEY(arr, arr_id));
 CREATE TABLE IF NOT EXISTS overrides(arr TEXT, arr_id TEXT, xid INTEGER, PRIMARY KEY(arr, arr_id));
+CREATE TABLE IF NOT EXISTS unlinks(arr TEXT, arr_id TEXT, work TEXT, at REAL, PRIMARY KEY(arr, arr_id, work));
 CREATE TABLE IF NOT EXISTS unmatched(arr TEXT, arr_id TEXT, title TEXT, year INTEGER, seen REAL,
   PRIMARY KEY(arr, arr_id));
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, nzo TEXT UNIQUE, source TEXT, arr TEXT,
@@ -349,7 +354,8 @@ def init_db():
     ex("CREATE TABLE IF NOT EXISTS arr_lib(kind TEXT, arr_id INTEGER, tmdb INTEGER, tvdb INTEGER, norm TEXT, "
        "year INTEGER, has_file INTEGER)")
     have = {r["name"] for r in q("PRAGMA table_info(arr_lib)")}
-    for col, typ in (("monitored", "INTEGER DEFAULT 0"), ("available", "INTEGER DEFAULT 1"), ("title", "TEXT")):
+    for col, typ in (("monitored", "INTEGER DEFAULT 0"), ("available", "INTEGER DEFAULT 1"), ("title", "TEXT"),
+                     ("imdb", "TEXT")):
         if col not in have:
             ex("ALTER TABLE arr_lib ADD COLUMN %s %s" % (col, typ))
     ex("CREATE TABLE IF NOT EXISTS wanted(kind TEXT, arr_id INTEGER, arr_ep INTEGER, work TEXT, season INTEGER, "
@@ -1299,6 +1305,108 @@ def equivalents(kind, cid):
     return sorted(ids, key=prio)
 
 
+def drop_unlinked(table, arr, arr_id, ids):
+    """Leave out catalog titles you marked as not being this Radarr movie or Sonarr series."""
+    bad = {r["work"] for r in q("SELECT work FROM unlinks WHERE arr=? AND arr_id=?", arr, str(arr_id))}
+    if not bad or not ids:
+        return ids
+    keep = []
+    for i in ids:
+        r = q1("SELECT work FROM %s WHERE id=?" % table, i)
+        if not (r and r["work"] in bad):
+            keep.append(i)
+    return keep
+
+
+def link_key(lib_row):
+    """How Radarr and Sonarr searches name a title (TMDB ID for movies, TVDB ID for series); overrides, unlinks and
+    matches are stored under this key."""
+    if not lib_row:
+        return None
+    if lib_row["kind"] == "movie":
+        return str(lib_row["tmdb"]) if lib_row["tmdb"] else (lib_row["imdb"] or None)
+    return str(lib_row["tvdb"]) if lib_row["tvdb"] else None
+
+
+def arr_links(kind, xid):
+    """The Radarr movies (or Sonarr series) a catalog title is linked to, and how."""
+    arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
+    row = q1("SELECT work, tmdb, norm, year FROM %s WHERE id=?" % table, xid)
+    if not row or not row["work"]:
+        return []
+    w = q1("SELECT * FROM works WHERE kind=? AND work=?", kind, row["work"])
+    mt = (w["mt"] or w["tmdb"]) if w else row["tmdb"]
+    nrm, yr = (w["norm"], w["year"]) if w else (row["norm"], row["year"])
+    out, seen = [], set()
+    key = "CAST(l.%s AS TEXT)" % ("tmdb" if kind == "movie" else "tvdb")
+    for r in q("SELECT l.* FROM overrides o JOIN %s x ON x.id=o.xid JOIN arr_lib l ON l.kind=? AND %s=o.arr_id "
+               "WHERE o.arr=? AND x.work=?" % (table, key), kind, arr, row["work"]):
+        seen.add(r["arr_id"])
+        out.append((r, "manual"))
+    for r in q("SELECT * FROM arr_lib l WHERE l.kind=? AND ((? IS NOT NULL AND l.tmdb=?) OR (l.norm=? AND (? IS NULL OR "
+               "l.year IS NULL OR ABS(l.year-?)<=1))) AND NOT EXISTS (SELECT 1 FROM unlinks u WHERE u.arr=? AND "
+               "u.arr_id=%s AND u.work=?)" % key, kind, mt, mt, nrm, yr, yr, arr, row["work"]):
+        if r["arr_id"] not in seen:
+            seen.add(r["arr_id"])
+            out.append((r, "tmdb" if mt and r["tmdb"] == mt else "title"))
+    return [{"arr": arr, "arr_id": r["arr_id"], "title": r["title"], "year": r["year"], "tmdb": r["tmdb"],
+             "imdb": r["imdb"], "tvdb": r["tvdb"], "has_file": bool(r["has_file"]), "monitored": bool(r["monitored"]),
+             "how": how} for r, how in out]
+
+
+def link_change(data):
+    """'Not this movie' (unlink) or 'link to a different movie' (relink) for a catalog title."""
+    kind = "movie" if data.get("kind") == "movie" else "series"
+    arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
+    xid = to_int(data.get("xid"))
+    row = q1("SELECT id, work, clean, year FROM %s WHERE id=?" % table, xid)
+    if not row or not row["work"]:
+        raise ValueError("Title not found")
+    olds = data.get("unlink")
+    olds = [to_int(x) for x in (olds if isinstance(olds, list) else [olds]) if to_int(x)]
+    new = to_int(data.get("link"))
+    name = "%s (%s)" % (row["clean"], row["year"] or "?")
+    for old in olds:
+        if old == new:
+            continue
+        was = q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, old)
+        key = link_key(was)
+        if not key:
+            continue
+        ex("INSERT OR REPLACE INTO unlinks(arr, arr_id, work, at) VALUES(?,?,?,?)", arr, key, row["work"], time.time())
+        ex("DELETE FROM overrides WHERE arr=? AND arr_id=? AND xid IN (SELECT id FROM %s WHERE work=?)" % table,
+           arr, key, row["work"])
+        ex("DELETE FROM matches WHERE arr=? AND arr_id=?", arr, key)
+        log("%s is not %s's %s (%s)" % (name, arr.title(), was["title"], was["year"]))
+    if new:
+        lib = q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, new)
+        key = link_key(lib)
+        if not key:
+            raise ValueError("That %s is not in %s's library, or has no %s ID" % (
+                kind, arr.title(), "TMDB" if kind == "movie" else "TVDB"))
+        ex("DELETE FROM unlinks WHERE arr=? AND arr_id=? AND work=?", arr, key, row["work"])
+        ex("INSERT OR REPLACE INTO overrides(arr, arr_id, xid) VALUES(?,?,?)", arr, key, row["id"])
+        ex("DELETE FROM matches WHERE arr=? AND arr_id=?", arr, key)
+        ex("DELETE FROM unmatched WHERE arr=? AND arr_id=?", arr, key)
+    if new:
+        log("%s is now linked to %s's %s (%s)" % (name, arr.title(), lib["title"], lib["year"]))
+    _facet_cache.clear()
+    threading.Thread(target=refresh_wanted, daemon=True).start()
+    return {"links": arr_links(kind, row["id"])}
+
+
+def arr_lib_search(kind, text):
+    """Radarr movies or Sonarr series by title, for 'link to a different movie'."""
+    toks = [t for t in norm(text or "").split() if t]
+    if not toks:
+        return []
+    sql = " AND ".join("norm LIKE ?" for _ in toks)
+    rows = q("SELECT * FROM arr_lib WHERE kind=? AND %s ORDER BY title LIMIT 25" % sql, kind,
+             *["%" + t + "%" for t in toks])
+    return [{"arr_id": r["arr_id"], "title": r["title"], "year": r["year"], "tmdb": r["tmdb"], "imdb": r["imdb"],
+             "tvdb": r["tvdb"], "has_file": bool(r["has_file"])} for r in rows]
+
+
 def match(arr, arr_id, info_fn, tmdb_hint=None):
     """Return (catalog ids, arr info) for an arr item."""
     kind = "movie" if arr == "radarr" else "series"
@@ -1315,6 +1423,7 @@ def match(arr, arr_id, info_fn, tmdb_hint=None):
     m = q1("SELECT xids, checked FROM matches WHERE arr=? AND arr_id=?", arr, arr_id)
     if m and time.time() - (m["checked"] or 0) < 6 * 3600:
         ids = [i for i in json.loads(m["xids"] or "[]") if q1("SELECT 1 FROM %s WHERE id=? AND %s" % (table, live()), i)]
+        ids = drop_unlinked(table, arr, arr_id, ids)
         if ids:
             return ids, info
     titles = titles_of(info) if info else []
@@ -1323,8 +1432,12 @@ def match(arr, arr_id, info_fn, tmdb_hint=None):
     if not titles and not tmdb:
         return [], info
     ids, method, sc = find_catalog(kind, titles, year, tmdb)
+    ids = drop_unlinked(table, arr, arr_id, ids)
+    if not ids and method == "tmdb" and titles:  # every TMDB match was unlinked: try by title instead
+        ids, method, sc = find_catalog(kind, titles, year, None)
+        ids = drop_unlinked(table, arr, arr_id, ids)
     if ids:
-        ids = sorted(set(ids) | set(equivalents(kind, ids[0])), key=prio)
+        ids = drop_unlinked(table, arr, arr_id, sorted(set(ids) | set(equivalents(kind, ids[0])), key=prio))
     title = titles[0] if titles else ""
     ex("INSERT OR REPLACE INTO matches(arr, arr_id, xids, method, score, title, year, checked) VALUES(?,?,?,?,?,?,?,?)",
        arr, arr_id, json.dumps(ids), method, sc, title, year, time.time())
@@ -1742,20 +1855,20 @@ def refresh_library(wanted=True):
             for m in RADARR.call("GET", "/api/v3/movie", timeout=120) or []:
                 rows.append(("movie", m.get("id"), to_int(m.get("tmdbId")), None, norm(m.get("title")),
                              to_int(m.get("year")), 1 if m.get("hasFile") else 0, 1 if m.get("monitored") else 0,
-                             1 if m.get("isAvailable", True) else 0, m.get("title") or ""))
+                             1 if m.get("isAvailable", True) else 0, m.get("title") or "", m.get("imdbId") or None))
         if SONARR.ok():
             for sr in SONARR.call("GET", "/api/v3/series", timeout=120) or []:
                 st = sr.get("statistics") or {}
                 rows.append(("series", sr.get("id"), to_int(sr.get("tmdbId")), to_int(sr.get("tvdbId")),
                              norm(sr.get("title")), to_int(sr.get("year")),
                              1 if (st.get("episodeFileCount") or 0) > 0 else 0, 1 if sr.get("monitored") else 0, 1,
-                             sr.get("title") or ""))
+                             sr.get("title") or "", sr.get("imdbId") or None))
         c = db()
         c.execute("BEGIN")
         try:
             c.execute("DELETE FROM arr_lib")
             c.executemany("INSERT INTO arr_lib(kind, arr_id, tmdb, tvdb, norm, year, has_file, monitored, available, "
-                          "title) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+                          "title, imdb) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
@@ -1778,7 +1891,15 @@ WANTED = {"running": False, "at": 0, "error": ""}
 
 def arr_work(kind, lib_row):
     """The catalog title (merged across providers) matching an arr library entry, if any provider has it."""
+    arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
+    key = link_key(lib_row)
+    o = q1("SELECT xid FROM overrides WHERE arr=? AND arr_id=?", arr, key) if key else None
+    r = q1("SELECT work FROM %s WHERE id=? AND %s" % (table, live()), o["xid"]) if o else None
+    if r and r["work"]:
+        return r["work"]
     adult = "" if S().get("show_adult") else " AND adult=0"
+    bad = [x["work"] for x in q("SELECT work FROM unlinks WHERE arr=? AND arr_id=?", arr, key)] if key else []
+    adult += "".join(" AND work<>'%s'" % w.replace("'", "''") for w in bad)
     r = q1("SELECT work FROM works WHERE kind=? AND mt IS NOT NULL AND mt=?%s LIMIT 1" % adult, kind,
            lib_row["tmdb"]) if lib_row["tmdb"] else None
     if not r and lib_row["norm"]:
@@ -4418,7 +4539,8 @@ def config_export():
     return {"vodgrab_config": 1, "version": VERSION, "exported": time.time(),
             "settings": {k: v for k, v in S().items() if k in DEFAULTS},
             "providers": [dict(r) for r in q("SELECT * FROM providers ORDER BY priority, id")],
-            "overrides": [dict(r) for r in q("SELECT * FROM overrides")]}
+            "overrides": [dict(r) for r in q("SELECT * FROM overrides")],
+            "unlinks": [dict(r) for r in q("SELECT * FROM unlinks")]}
 
 
 def config_import(cfg):
@@ -4446,6 +4568,11 @@ def config_import(cfg):
             for o in cfg.get("overrides") or []:
                 c.execute("INSERT OR REPLACE INTO overrides(arr, arr_id, xid) VALUES(?,?,?)",
                           (o.get("arr"), str(o.get("arr_id")), o.get("xid")))
+            if "unlinks" in cfg:
+                c.execute("DELETE FROM unlinks")
+                for u in cfg.get("unlinks") or []:
+                    c.execute("INSERT OR REPLACE INTO unlinks(arr, arr_id, work, at) VALUES(?,?,?,?)",
+                              (u.get("arr"), str(u.get("arr_id")), u.get("work"), u.get("at")))
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
@@ -4763,8 +4890,14 @@ def lib_sql(kind, a="t", tcol=None):
     """SQL for 'this title is in Radarr/Sonarr', 'has a file there' and 'VODgrab downloaded it'."""
     k = "movie" if kind == "movie" else "series"
     tc = tcol or "%s.tmdb" % a
-    m = ("SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND ((%s IS NOT NULL AND l.tmdb=%s) OR "
-         "(l.norm=%s.norm AND (%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1)))" % (k, tc, tc, a, a, a))
+    arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
+    # Linked by TMDB ID or title and year, unless you said it is not this title; or linked by hand
+    key = "CAST(l.%s AS TEXT)" % ("tmdb" if kind == "movie" else "tvdb")  # how Radarr/Sonarr searches name it
+    m = ("SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND ((((%s IS NOT NULL AND l.tmdb=%s) OR "
+         "(l.norm=%s.norm AND (%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1))) AND NOT EXISTS "
+         "(SELECT 1 FROM unlinks u WHERE u.arr='%s' AND u.arr_id=%s AND u.work=%s.work)) OR %s IN "
+         "(SELECT o.arr_id FROM overrides o JOIN %s x ON x.id=o.xid WHERE o.arr='%s' AND x.work=%s.work))"
+         % (k, tc, tc, a, a, a, arr, key, a, key, table, arr, a))
     if kind == "movie":
         vg = ("SELECT 1 FROM jobs j WHERE j.kind='movie' AND j.status IN ('imported','completed') AND j.xid IN "
               "(SELECT id FROM movies x INDEXED BY movies_work WHERE x.work=%s.work)" % a)
@@ -5312,6 +5445,8 @@ def movie_detail(xid):
         log("Details for %s failed: %s" % (m["clean"], e), "warn")
         out["meta"] = {"has": False, "error": mask(str(e))}
     out["tmdb"] = out.get("tmdb") or out["meta"].get("tmdb")
+    out["links"] = arr_links("movie", xid)
+    out["arr_ok"] = RADARR.ok()
     if RADARR.ok() and out.get("tmdb"):
         try:
             found = [x for x in RADARR.get("/api/v3/movie", tmdbId=out["tmdb"]) or []
@@ -5882,6 +6017,10 @@ class Handler(BaseHTTPRequestHandler):
             ex("DELETE FROM unmatched WHERE arr=? AND arr_id=?", arr, arr_id)
             ex("DELETE FROM matches WHERE arr=? AND arr_id=?", arr, arr_id)
             return self.send(200, {"ok": True})
+        if a == "link" and method == "POST":
+            return self.send(200, link_change(data))
+        if a == "arrsearch":
+            return self.send(200, arr_lib_search("movie" if qs.get("kind") == "movie" else "series", qs.get("q")))
         if a == "dismiss" and method == "POST":
             ex("DELETE FROM unmatched WHERE arr=? AND arr_id=?", data["arr"], str(data["arr_id"]))
             return self.send(200, {"ok": True})
@@ -5916,6 +6055,13 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(catalog_report(), indent=1, ensure_ascii=False).encode()
             return self.send(200, body, "application/json", {
                 "Content-Disposition": 'attachment; filename="vodgrab-catalog-report.json"'})
+        if a == "dispatcharr":
+            sub = parts[1] if len(parts) > 1 else ""
+            if method == "POST" and sub == "self":
+                return self.send(200, dispatcharr_add_self())
+            if method == "POST" and sub == "import":
+                return self.send(200, dispatcharr_import(data.get("accounts")))
+            return self.send(200, dispatcharr_connect(data if method == "POST" else {}))
         if a == "update":
             if method == "POST" and len(parts) > 1 and parts[1] == "apply":
                 return self.send(200, apply_update())
@@ -5927,6 +6073,96 @@ class Handler(BaseHTTPRequestHandler):
         if a == "logs":
             return self.send(200, list(LOG)[-300:])
         self.send(404, {"error": "unknown endpoint"})
+
+
+# ------------------------------------------------------------------ dispatcharr
+
+def dispatcharr_call(path, url=None, key=None):
+    """GET from Dispatcharr's API with an API key (Dispatcharr: Settings → Users → your user → API key)."""
+    url = (url if url is not None else S().get("dispatcharr_url") or "").strip().rstrip("/")
+    key = (key or S().get("dispatcharr_api_key") or "").strip()
+    if not url or not key:
+        raise ValueError("Enter Dispatcharr's address and an API key first")
+    if not re.match(r"^https?://", url):
+        url = "http://" + url
+    try:
+        _, raw = http(url + path, headers={"X-API-Key": key, "Accept": "application/json"}, timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise ValueError("Dispatcharr refused the API key (HTTP %s)" % e.code)
+        raise ValueError("Dispatcharr returned HTTP %s for %s" % (e.code, path))
+    except (urllib.error.URLError, OSError) as e:
+        raise ValueError("Dispatcharr unreachable at %s: %s" % (url, getattr(e, "reason", e)))
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise ValueError("Dispatcharr's answer was not JSON; check the address (for example http://dispatcharr:9191)")
+    return data.get("results", data) if isinstance(data, dict) and "results" in data else data
+
+
+def dispatcharr_connect(data):
+    """Check the address and key, save them, and list Dispatcharr's Xtream accounts."""
+    url = (data.get("url") or S().get("dispatcharr_url") or "").strip().rstrip("/")
+    key = (data.get("api_key") or "").strip() or S().get("dispatcharr_api_key") or ""
+    me = dispatcharr_call("/api/accounts/users/me/", url, key)
+    accounts = dispatcharr_call("/api/m3u/accounts/", url, key)
+    save_settings({"dispatcharr_url": url, "dispatcharr_api_key": key})
+    have = {(p["url"].rstrip("/").lower(), (p["username"] or "").lower()) for p in PROVIDERS.values()}
+    out = []
+    for a in accounts if isinstance(accounts, list) else []:
+        if a.get("account_type") != "XC" or not a.get("server_url"):
+            continue
+        server = a["server_url"].strip().rstrip("/")
+        out.append({"id": a.get("id"), "name": a.get("name") or server, "server_url": server,
+                    "username": a.get("username") or "", "max_streams": a.get("max_streams") or 0,
+                    "active": bool(a.get("is_active", True)), "priority": a.get("priority"),
+                    "added": (server.lower(), (a.get("username") or "").lower()) in have})
+    props = (me.get("custom_properties") or {}) if isinstance(me, dict) else {}
+    base = dispatcharr_base()
+    return {"user": me.get("username") if isinstance(me, dict) else "", "xc_ready": bool(props.get("xc_password")),
+            "accounts": out, "self_added": any(p["url"].rstrip("/").lower() == base.lower() for p in PROVIDERS.values())}
+
+
+def dispatcharr_base():
+    url = (S().get("dispatcharr_url") or "").strip().rstrip("/")
+    return url if not url or re.match(r"^https?://", url) else "http://" + url
+
+
+def dispatcharr_add_self():
+    """Add Dispatcharr itself as a provider: its Xtream output, logged in as the API key's user."""
+    me = dispatcharr_call("/api/accounts/users/me/")
+    props = me.get("custom_properties") or {}
+    if not props.get("xc_password"):
+        raise ValueError("Your Dispatcharr user %s has no XC password yet. Set one in Dispatcharr (Users, edit your "
+                         "user, XC password), then try again." % me.get("username"))
+    base = dispatcharr_base()
+    existing = next((p for p in PROVIDERS.values() if p["url"].rstrip("/").lower() == base.lower()), None)
+    limit = to_int(me.get("stream_limit")) or 0
+    pid = save_provider({"id": existing["id"] if existing else None, "name": existing["name"] if existing else "Dispatcharr",
+                         "url": base, "username": me.get("username"), "password": props["xc_password"],
+                         "max_conn": existing["max_conn"] if existing else (min(limit, 3) if limit else 2),
+                         "priority": existing["priority"] if existing else 0, "enabled": True})
+    log("Dispatcharr %s as a provider (user %s)" % ("updated" if existing else "added", me.get("username")))
+    return {"id": pid, "providers": providers_view()}
+
+
+def dispatcharr_import(items):
+    """Add the chosen Dispatcharr Xtream accounts as providers. Dispatcharr never shares passwords, so each one
+    comes from the form."""
+    by_id = {a["id"]: a for a in dispatcharr_connect({})["accounts"]}
+    added = []
+    for it in items or []:
+        a = by_id.get(to_int(it.get("id")))
+        pw = (it.get("password") or "").strip()
+        if not a or not pw:
+            continue
+        save_provider({"name": a["name"], "url": a["server_url"], "username": a["username"], "password": pw,
+                       "max_conn": max(1, min(20, a["max_streams"] or 1)), "enabled": a["active"]})
+        added.append(a["name"])
+    if not added:
+        raise ValueError("Nothing imported: enter the password for each account you want to add")
+    log("Imported from Dispatcharr: %s" % ", ".join(added))
+    return {"added": added, "providers": providers_view()}
 
 
 # ------------------------------------------------------------------ updates
@@ -6841,6 +7077,24 @@ function wireDetail(kind,m){const sh=$("#sheet");
   $$("[data-kw]",sh).forEach(b=>b.onclick=()=>browseWith({q:`kw:"${b.dataset.kw}"`},kind));
   $$("[data-open]",sh).forEach(b=>b.onclick=()=>{const [k,i]=b.dataset.open.split(":");k=="movie"?openMovie(+i):openSeries(+i)});
   const t=$("#trl");if(t)t.onclick=()=>{const v=m.videos[0];const box=$("#trbox");box.innerHTML=box.innerHTML?"":`<div class="trailer"><iframe src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(v.k)}?autoplay=1&rel=0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>`;if(box.innerHTML)box.scrollIntoView({behavior:"smooth",block:"nearest"})}}
+function drawLinks(kind,id,links){const box=$("#linkSec");if(!box)return;
+  const A=kind=="movie"?"Radarr":"Sonarr",w=kind=="movie"?"movie":"series";
+  const how={tmdb:"matched by TMDB ID",title:"matched by title and year",manual:"linked by you"};
+  const ids=l=>[l.imdb,l.tmdb?"TMDB "+l.tmdb:"",l.tvdb?"TVDB "+l.tvdb:""].filter(Boolean).join(" · ");
+  box.innerHTML=`<h4>Linked in ${A}</h4>${links.length?links.map(l=>`<div class="src"><span class="pn">${esc(l.title)}${l.year?` (${l.year})`:""}</span>
+      <span class="mi">${esc([ids(l),how[l.how],l.has_file?"has a file":"no file yet"].filter(Boolean).join(" · "))}</span>
+      <button class="btn s d" data-un="${l.arr_id}">Not this ${w}</button></div>`).join(""):`<div class="muted">Not linked to anything in ${A}. VODgrab will not offer this title to ${A}.</div>`}
+    <div class="tools" style="margin:8px 0 0"><button class="btn s" id="lnkChg">Link to a different ${w}…</button></div><div id="lnkPick"></div>`;
+  $$("[data-un]",box).forEach(b=>b.onclick=async()=>{const l=links.find(y=>y.arr_id==b.dataset.un);
+    if(!confirm(`This title is not ${A}'s "${l.title}${l.year?" ("+l.year+")":""}"?\n\nVODgrab will stop offering it to ${A} for that ${w} and remove it from Wanted.`))return;
+    try{const r=await api("link",{kind,xid:id,unlink:+b.dataset.un});drawLinks(kind,id,r.links);toast(`Unlinked from ${A}`)}catch(e){toast(e.message,1)}});
+  $("#lnkChg").onclick=()=>{const pk=$("#lnkPick");pk.innerHTML=`<input id="lnkQ" placeholder="Search ${A}'s library" style="margin-top:8px;width:100%;max-width:420px"><div id="lnkRes" style="margin-top:6px"></div>`;
+    const q=$("#lnkQ");q.focus();let tm;q.oninput=()=>{clearTimeout(tm);tm=setTimeout(async()=>{if(q.value.trim().length<2){$("#lnkRes").innerHTML="";return}
+      const r=(await api(`arrsearch?kind=${kind}&q=${encodeURIComponent(q.value)}`)).filter(c=>!links.some(l=>l.arr_id==c.arr_id));
+      $("#lnkRes").innerHTML=r.length?r.map(c=>`<div class="src"><span class="pn">${esc(c.title)}${c.year?` (${c.year})`:""}</span><span class="mi">${esc(ids(c))}</span>
+        <button class="btn s p" data-ln="${c.arr_id}">Link</button></div>`).join(""):`<div class="muted">Nothing in ${A} matches.</div>`;
+      $$("[data-ln]",$("#lnkRes")).forEach(b=>b.onclick=async()=>{
+        try{const r=await api("link",{kind,xid:id,link:+b.dataset.ln,unlink:links.map(l=>l.arr_id)});drawLinks(kind,id,r.links);toast(`Linked in ${A}`)}catch(e){toast(e.message,1)}})},250)}}}
 async function openMovie(id){
   modal(`<div class="head"><div>Loading…</div><button class="x">×</button></div>`);
   let x;try{x=await api("movie/"+id)}catch(e){toast(e.message,1);closeModal();return}
@@ -6856,10 +7110,11 @@ async function openMovie(id){
       <span class="mi" title="${esc(s.name)}">${esc(qinfo(s))} · ${esc(s.ext)}</span>
       ${s.known?"":`<button class="btn s" data-chk>Check quality</button>`}<button class="btn s" data-play>▶ Play</button><button class="btn s p" data-dl>Download</button></div>`).join("")}</div>
       <div class="tools" style="margin:8px 0 0">${nowBox}<span class="muted" style="font-size:12px">${x.sources.length>1?"Starts with the provider you pick and falls back to the others. ":""}Check quality reads the file header for a few seconds.</span></div></div>
+    ${x.arr_ok?`<div class="sec" id="linkSec"></div>`:""}
     ${peopleHtml(m)}${watchHtml(m)}${col}${recsHtml(m)}${kwHtml(m)}${idsHtml("movie",m,x)}</div>`);
-  wireDetail("movie",m);
+  wireDetail("movie",m);if(x.arr_ok)drawLinks("movie",id,x.links);
   if($("#addm"))$("#addm").onclick=e=>addArr([{kind:"movie",id}],e.target);
-  $$(".src").forEach(r=>{const sid=+r.dataset.sid;
+  $$(".src[data-sid]").forEach(r=>{const sid=+r.dataset.sid;
     $("[data-dl]",r).onclick=async e=>{e.target.disabled=true;await dl({kind:"movie",id:sid,now:$("#now").checked});closeModal()};
     $("[data-play]",r).onclick=()=>{const s=x.sources.find(y=>y.id==sid)||{};play("movie",sid,x.clean+" from "+(s.provider||""),[s.quality,s.codec,s.ext].filter(Boolean).join(" · "))};
     const c=$("[data-chk]",r);if(c)c.onclick=async()=>{const q=await probeIt("movie",sid,c);if(q){c.remove();$(".q",r).outerHTML=qb(q);$(".mi",r).textContent=qinfo(q)}}});
@@ -7087,6 +7342,14 @@ async function renderSettings(){
   <section class="set"><h3>Providers</h3>
     <div class="hint muted" style="margin-bottom:10px">Each title downloads from the first provider in priority order that has it and a free connection. If it fails there, the next provider is tried.</div>
     <div id="provs"></div><button class="btn s" id="addProv">Add provider</button></section>
+  <section class="set"><h3>Dispatcharr</h3>
+    <div class="hint muted" style="margin-bottom:10px">Use Dispatcharr as a provider, so downloads go through it and count toward each account's connection limit together with live TV. Or copy Dispatcharr's Xtream accounts into VODgrab as providers.</div>
+    <div class="fields">
+    ${fld("dispatcharr_url","Dispatcharr address","text","For example http://dispatcharr:9191")}
+    ${fld("dispatcharr_api_key","Dispatcharr API key","secret","In Dispatcharr: Users, edit your user, API key")}
+    </div>
+    <div class="tools" style="margin-top:10px"><button class="btn s" id="dpConnect">Connect</button></div>
+    <div id="dpBox"></div></section>
   ${arrSec("sonarr","Sonarr")}${arrSec("radarr","Radarr")}
   <section class="set"><h3>Folders</h3>
     <div class="hint muted" style="margin-bottom:10px">Downloads land in these folders first. Sonarr and Radarr then rename and move each file into their own library. All of these paths must be visible to Sonarr and Radarr at the same path.</div>
@@ -7206,6 +7469,22 @@ async function renderSettings(){
     try{const r=await fetch("/api/report");if(!r.ok)throw new Error((await r.json()).error||r.statusText);const blob=await r.blob();
       const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="vodgrab-catalog-report.json";document.body.appendChild(a);a.click();a.remove();toast("Report downloaded")}
     catch(x){toast(x.message,1)}b.disabled=false;b.textContent="Download catalog report"};
+  const dpDraw=r=>{const box=$("#dpBox");
+    const acc=r.accounts.length?`<div style="margin-top:12px"><b>Import Xtream accounts</b><div class="hint" style="margin:4px 0 8px">Dispatcharr does not share passwords, so enter each account's password. Accounts left blank are skipped.</div>
+      ${r.accounts.map(a=>`<div class="f" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <span style="min-width:200px"><b>${esc(a.name)}</b><br><span class="muted">${esc(a.username)} @ ${esc(a.server_url)}${a.max_streams?` · ${a.max_streams} stream${a.max_streams>1?"s":""}`:""}</span></span>
+        ${a.added?`<span class="pill ok">Already a provider</span>`:`<input type="password" data-dpa="${a.id}" placeholder="Password" autocomplete="new-password" style="max-width:220px">`}</div>`).join("")}
+      <button class="btn s" id="dpImport">Import</button></div>`:`<div class="muted" style="margin-top:10px">Dispatcharr has no Xtream accounts to import.</div>`;
+    box.innerHTML=`<div class="sub" style="margin-top:6px">Connected as <b>${esc(r.user)}</b>.</div>
+      <div style="margin-top:10px">${r.self_added?`<span class="pill ok">Dispatcharr is a provider</span> <button class="btn s" id="dpSelf">Update its login</button>`:
+        r.xc_ready?`<button class="btn s p" id="dpSelf">Use Dispatcharr as a provider</button>`:
+        `<span class="muted">To use Dispatcharr as a provider, give your Dispatcharr user an XC password first (Users, edit your user), then press Connect again.</span>`}</div>${acc}`;
+    const sb=$("#dpSelf");if(sb)sb.onclick=async()=>{try{const x=await api("dispatcharr/self",{});drawProvs(x.providers);toast("Dispatcharr saved as a provider. Run a sync to load its catalog.");refreshStatus();dpDraw(await api("dispatcharr"))}catch(e){toast(e.message,1)}};
+    const ib=$("#dpImport");if(ib)ib.onclick=async()=>{const accounts=$$("[data-dpa]",box).map(i=>({id:+i.dataset.dpa,password:i.value})).filter(x=>x.password);
+      try{const x=await api("dispatcharr/import",{accounts});drawProvs(x.providers);toast(`Imported ${x.added.join(", ")}. Run a sync to load the catalog.`);refreshStatus();dpDraw(await api("dispatcharr"))}catch(e){toast(e.message,1)}}};
+  $("#dpConnect").onclick=async()=>{const b=$("#dpConnect");b.disabled=true;$("#dpBox").innerHTML=`<div class="muted">Connecting…</div>`;
+    try{dpDraw(await api("dispatcharr",{url:$("#s_dispatcharr_url").value,api_key:$("#s_dispatcharr_api_key").value}))}catch(e){$("#dpBox").innerHTML=`<div class="muted" style="color:var(--bad)">${esc(e.message)}</div>`}b.disabled=false};
+  if(SV.settings.dispatcharr_url&&SV.secrets_set.dispatcharr_api_key)api("dispatcharr").then(dpDraw).catch(e=>{$("#dpBox").innerHTML=`<div class="muted" style="color:var(--bad)">${esc(e.message)}</div>`});
   let updLatest="";
   const updShow=u=>{const box=$("#updBox");if(!box)return;updLatest=u.latest;
     let h=`You have VODgrab <b>${esc(u.current)}</b>`;

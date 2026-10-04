@@ -31,6 +31,8 @@ It is VERY important to note, this was made entirely by AI.
 - **Unmatched review.** Fix titles VODgrab couldn't match yourself, and the fix is remembered.
 - **Backups.** Scheduled backups of settings, metadata and the catalog, with restore from the UI.
 - **Sync change lists.** See exactly which titles each catalog sync added or removed, and download the list.
+- **Dispatcharr.** Download through Dispatcharr, so it enforces connection limits shared with live TV, or import its Xtream accounts as providers.
+- **Fix wrong matches.** Unlink a title from the wrong Radarr movie, or link it to the right one.
 - **In-app updates.** Get notified of new versions, with release notes and one-click updating for Python-file installs.
 - **Web login** and a SABnzbd-style API key.
 
@@ -134,6 +136,17 @@ services:
 3. Search in Sonarr or Radarr as usual. Releases from your provider have names ending in `.IPTV`, like `Movie.Name.2023.1080p.WEB-DL.IPTV`.
 
 To add VODgrab by hand instead: in Sonarr or Radarr, add a **Newznab** indexer and a **SABnzbd** download client, both with host `vodgrab`, port `8765`, and the API key shown in VODgrab's settings.
+
+## Dispatcharr
+
+If you use [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr), open **Settings → Dispatcharr**, enter its address (for example `http://dispatcharr:9191`) and an API key (in Dispatcharr: Users, edit your user, API key), and press **Connect**. Then:
+
+- **Use Dispatcharr as a provider:** VODgrab downloads through Dispatcharr's Xtream output, logged in as your Dispatcharr user. Dispatcharr then counts VODgrab's downloads toward each account's connection limit, together with live TV. Your Dispatcharr user needs an XC password, and VOD has to be turned on for the accounts in Dispatcharr.
+- **Import Xtream accounts:** copy Dispatcharr's Xtream accounts into VODgrab as providers. Dispatcharr never shares passwords, so you enter each one once.
+
+## Fixing a wrong match
+
+If VODgrab links a title to the wrong Radarr movie (for example *Snow White* (2025) vs *Snow White and the Seven Dwarfs*), open the title. Under **Linked in Radarr**, press **Not this movie** to unlink it, or **Link to a different movie** to pick the right one from your Radarr library. VODgrab remembers this, and from then on offers the title to Radarr and lists it on Wanted only for the movie you chose. For titles with no match at all, use the **Unmatched** page.
 
 ## Install with just the Python file
 
