@@ -2,6 +2,11 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.11.0 (2026-10-04)
+
+- **Dispatcharr:** two checkboxes, **Download through Dispatcharr** and **Import Dispatcharr's Xtream logins as providers**. Use either or both, and turn each off again (its providers are switched off, not deleted).
+- **Every profile counts:** each active Dispatcharr profile is imported as its own login with its own stream limit, so an account with two 5-stream profiles gives VODgrab 10 streams. Passwords come from Dispatcharr when it has them, and are refreshed before each sync.
+
 ## 1.10.0 (2026-10-04)
 
 - **Dispatcharr:** connect Dispatcharr in Settings with its address and an API key. Then either use Dispatcharr as a provider (downloads go through it, so they count toward each account's connection limit together with live TV), or import its Xtream accounts as providers (you enter each password, since Dispatcharr does not share them).

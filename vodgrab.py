@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -126,6 +126,8 @@ DEFAULTS = {
     "update_check": True,
     "dispatcharr_url": "",
     "dispatcharr_api_key": "",
+    "dispatcharr_proxy": False,
+    "dispatcharr_import": False,
 }
 SECRET_KEYS = ("sonarr_api_key", "radarr_api_key", "web_password", "tmdb_key", "omdb_key", "tvdb_key", "tvdb_pin",
                "dispatcharr_api_key")
@@ -301,6 +303,9 @@ def init_db():
     cols = {r["name"] for r in q("PRAGMA table_info(jobs)")}
     if "sources" not in cols:
         ex("ALTER TABLE jobs ADD COLUMN sources TEXT DEFAULT '[]'")
+    pcols = {r["name"] for r in q("PRAGMA table_info(providers)")}
+    if "source" not in pcols:
+        ex("ALTER TABLE providers ADD COLUMN source TEXT DEFAULT ''")
     if "prov" not in cols:
         ex("ALTER TABLE jobs ADD COLUMN prov INTEGER DEFAULT 0")
     have = {r["name"] for r in q("PRAGMA table_info(sync_runs)")}
@@ -447,6 +452,8 @@ def save_provider(data):
             "max_conn": max(1, min(20, to_int(data.get("max_conn")) or 1)),
             "priority": to_int(data.get("priority")) or 0,
             "enabled": 1 if data.get("enabled", True) not in (False, 0, "0", "false") else 0}
+    if "source" in data:
+        vals["source"] = data.get("source") or ""
     if data.get("password"):
         vals["password"] = data["password"]
     if pid:
@@ -485,6 +492,7 @@ def providers_view():
     out = []
     for p in PROVIDERS.values():
         d = {k: p[k] for k in ("id", "name", "url", "username", "user_agent", "max_conn", "priority", "enabled")}
+        d["source"] = p.get("source") or ""
         d["password_set"] = bool(p.get("password"))
         d["active"] = ENGINE.active_count(p["id"])
         d["error"] = ENGINE.prov_errors.get(p["id"], "")
@@ -1464,6 +1472,7 @@ def run_sync(trigger="schedule"):
         SYNC.update(running=True, phase="Starting", error="")
         started = time.time()
         run_id = ex("INSERT INTO sync_runs(started, trigger) VALUES(?, ?)", started, trigger).lastrowid
+        dispatcharr_refresh()
         provs = active_providers()
         if not provs:
             raise RuntimeError("No enabled providers")
@@ -4560,10 +4569,10 @@ def config_import(cfg):
                     c.execute("DELETE FROM providers WHERE id=?", (r["id"],))
             for p in provs:
                 c.execute("INSERT OR REPLACE INTO providers(id, name, url, username, password, user_agent, max_conn, "
-                          "priority, enabled) VALUES(?,?,?,?,?,?,?,?,?)",
+                          "priority, enabled, source) VALUES(?,?,?,?,?,?,?,?,?,?)",
                           (p.get("id"), p.get("name"), p.get("url"), p.get("username"), p.get("password"),
                            p.get("user_agent"), p.get("max_conn") or 1, p.get("priority") or 0,
-                           1 if p.get("enabled", 1) else 0))
+                           1 if p.get("enabled", 1) else 0, p.get("source") or ""))
             c.execute("DELETE FROM overrides")
             for o in cfg.get("overrides") or []:
                 c.execute("INSERT OR REPLACE INTO overrides(arr, arr_id, xid) VALUES(?,?,?)",
@@ -6057,10 +6066,8 @@ class Handler(BaseHTTPRequestHandler):
                 "Content-Disposition": 'attachment; filename="vodgrab-catalog-report.json"'})
         if a == "dispatcharr":
             sub = parts[1] if len(parts) > 1 else ""
-            if method == "POST" and sub == "self":
-                return self.send(200, dispatcharr_add_self())
-            if method == "POST" and sub == "import":
-                return self.send(200, dispatcharr_import(data.get("accounts")))
+            if method == "POST" and sub == "mode":
+                return self.send(200, dispatcharr_mode(data))
             return self.send(200, dispatcharr_connect(data if method == "POST" else {}))
         if a == "update":
             if method == "POST" and len(parts) > 1 and parts[1] == "apply":
@@ -6078,7 +6085,7 @@ class Handler(BaseHTTPRequestHandler):
 # ------------------------------------------------------------------ dispatcharr
 
 def dispatcharr_call(path, url=None, key=None):
-    """GET from Dispatcharr's API with an API key (Dispatcharr: Settings → Users → your user → API key)."""
+    """GET from Dispatcharr's API with an API key (Dispatcharr: Users, edit your user, API key)."""
     url = (url if url is not None else S().get("dispatcharr_url") or "").strip().rstrip("/")
     key = (key or S().get("dispatcharr_api_key") or "").strip()
     if not url or not key:
@@ -6100,69 +6107,154 @@ def dispatcharr_call(path, url=None, key=None):
     return data.get("results", data) if isinstance(data, dict) and "results" in data else data
 
 
-def dispatcharr_connect(data):
-    """Check the address and key, save them, and list Dispatcharr's Xtream accounts."""
-    url = (data.get("url") or S().get("dispatcharr_url") or "").strip().rstrip("/")
-    key = (data.get("api_key") or "").strip() or S().get("dispatcharr_api_key") or ""
-    me = dispatcharr_call("/api/accounts/users/me/", url, key)
-    accounts = dispatcharr_call("/api/m3u/accounts/", url, key)
-    save_settings({"dispatcharr_url": url, "dispatcharr_api_key": key})
-    have = {(p["url"].rstrip("/").lower(), (p["username"] or "").lower()) for p in PROVIDERS.values()}
-    out = []
-    for a in accounts if isinstance(accounts, list) else []:
-        if a.get("account_type") != "XC" or not a.get("server_url"):
-            continue
-        server = a["server_url"].strip().rstrip("/")
-        out.append({"id": a.get("id"), "name": a.get("name") or server, "server_url": server,
-                    "username": a.get("username") or "", "max_streams": a.get("max_streams") or 0,
-                    "active": bool(a.get("is_active", True)), "priority": a.get("priority"),
-                    "added": (server.lower(), (a.get("username") or "").lower()) in have})
-    props = (me.get("custom_properties") or {}) if isinstance(me, dict) else {}
-    base = dispatcharr_base()
-    return {"user": me.get("username") if isinstance(me, dict) else "", "xc_ready": bool(props.get("xc_password")),
-            "accounts": out, "self_added": any(p["url"].rstrip("/").lower() == base.lower() for p in PROVIDERS.values())}
-
-
 def dispatcharr_base():
     url = (S().get("dispatcharr_url") or "").strip().rstrip("/")
     return url if not url or re.match(r"^https?://", url) else "http://" + url
 
 
-def dispatcharr_add_self():
-    """Add Dispatcharr itself as a provider: its Xtream output, logged in as the API key's user."""
+DP_SELF = "dispatcharr:self"
+
+
+def dispatcharr_logins():
+    """Every login Dispatcharr has for its Xtream accounts: one per active profile, each with its own stream limit.
+    Dispatcharr keeps each profile's username and password from the provider's own account info once it has
+    refreshed that profile; those stay on this server and are never sent to the browser."""
+    out = []
+    for a in dispatcharr_call("/api/m3u/accounts/") or []:
+        if not isinstance(a, dict) or a.get("account_type") != "XC" or not a.get("server_url"):
+            continue
+        server = a["server_url"].strip().rstrip("/")
+        profiles = [p for p in a.get("profiles") or [] if isinstance(p, dict)] or [
+            {"id": 0, "name": "Default", "is_default": True, "is_active": True, "max_streams": a.get("max_streams")}]
+        for p in profiles:
+            if not p.get("is_active", True):
+                continue
+            ui = ((p.get("custom_properties") or {}).get("user_info") or {}) if isinstance(
+                p.get("custom_properties"), dict) else {}
+            user = ui.get("username") or (a.get("username") if p.get("is_default") else "") or ""
+            limit = to_int(p.get("max_streams")) or to_int(ui.get("max_connections")) or 0
+            out.append({"key": "dispatcharr:%s:%s" % (a.get("id"), p.get("id")),
+                        "name": a.get("name") if p.get("is_default") and len(profiles) == 1 else
+                        "%s · %s" % (a.get("name"), p.get("name") or "Profile %s" % p.get("id")),
+                        "account": a.get("name"), "profile": p.get("name"), "server_url": server, "username": user,
+                        "password": ui.get("password") or "", "max_streams": limit,
+                        "active": bool(a.get("is_active", True))})
+    return out
+
+
+def dp_provider(source):
+    return next((p for p in PROVIDERS.values() if (p.get("source") or "") == source), None)
+
+
+def dispatcharr_connect(data):
+    """Check the address and key, save them, and describe what Dispatcharr offers."""
+    url = (data.get("url") or S().get("dispatcharr_url") or "").strip().rstrip("/")
+    key = (data.get("api_key") or "").strip() or S().get("dispatcharr_api_key") or ""
+    me = dispatcharr_call("/api/accounts/users/me/", url, key)
+    save_settings({"dispatcharr_url": url, "dispatcharr_api_key": key})
+    logins = dispatcharr_logins()
+    have = {(p["url"].rstrip("/").lower(), (p["username"] or "").lower()) for p in PROVIDERS.values()}
+    view = []
+    for l in logins:
+        pr = dp_provider(l["key"])
+        v = {k: l[k] for k in ("key", "name", "account", "profile", "server_url", "username", "max_streams", "active")}
+        v.update(has_password=bool(l["password"]), provider=pr["id"] if pr else None,
+                 enabled=bool(pr and pr["enabled"]),
+                 added=bool(pr) or (l["server_url"].lower(), l["username"].lower()) in have)
+        view.append(v)
+    props = (me.get("custom_properties") or {}) if isinstance(me, dict) else {}
+    me_pr = dp_provider(DP_SELF)
+    return {"user": me.get("username") if isinstance(me, dict) else "", "xc_ready": bool(props.get("xc_password")),
+            "logins": view, "total_streams": sum(l["max_streams"] for l in logins if l["active"]),
+            "proxy": bool(S().get("dispatcharr_proxy")), "import": bool(S().get("dispatcharr_import")),
+            "self_provider": {"id": me_pr["id"], "max_conn": me_pr["max_conn"], "enabled": bool(me_pr["enabled"])}
+            if me_pr else None}
+
+
+def dispatcharr_self(enable=True):
+    """Download through Dispatcharr: its Xtream output, logged in as the API key's user."""
+    pr = dp_provider(DP_SELF) or next((p for p in PROVIDERS.values() if not p.get("source") and
+                                       p["url"].rstrip("/").lower() == dispatcharr_base().lower()), None)
+    if not enable:
+        if pr and pr["enabled"]:
+            save_provider(dict(pr, enabled=False, password=""))
+            log("Stopped downloading through Dispatcharr (its provider is disabled, not removed)")
+        return
     me = dispatcharr_call("/api/accounts/users/me/")
     props = me.get("custom_properties") or {}
     if not props.get("xc_password"):
         raise ValueError("Your Dispatcharr user %s has no XC password yet. Set one in Dispatcharr (Users, edit your "
                          "user, XC password), then try again." % me.get("username"))
-    base = dispatcharr_base()
-    existing = next((p for p in PROVIDERS.values() if p["url"].rstrip("/").lower() == base.lower()), None)
-    limit = to_int(me.get("stream_limit")) or 0
-    pid = save_provider({"id": existing["id"] if existing else None, "name": existing["name"] if existing else "Dispatcharr",
-                         "url": base, "username": me.get("username"), "password": props["xc_password"],
-                         "max_conn": existing["max_conn"] if existing else (min(limit, 3) if limit else 2),
-                         "priority": existing["priority"] if existing else 0, "enabled": True})
-    log("Dispatcharr %s as a provider (user %s)" % ("updated" if existing else "added", me.get("username")))
-    return {"id": pid, "providers": providers_view()}
+    save_provider({"id": pr["id"] if pr else None, "name": pr["name"] if pr else "Dispatcharr",
+                   "url": dispatcharr_base(), "username": me.get("username"), "password": props["xc_password"],
+                   "max_conn": pr["max_conn"] if pr else 2, "priority": pr["priority"] if pr else 0,
+                   "user_agent": pr["user_agent"] if pr else "", "enabled": True, "source": DP_SELF})
+    if not pr or not pr["enabled"]:
+        log("Downloading through Dispatcharr as user %s" % me.get("username"))
 
 
 def dispatcharr_import(items):
-    """Add the chosen Dispatcharr Xtream accounts as providers. Dispatcharr never shares passwords, so each one
-    comes from the form."""
-    by_id = {a["id"]: a for a in dispatcharr_connect({})["accounts"]}
-    added = []
-    for it in items or []:
-        a = by_id.get(to_int(it.get("id")))
-        pw = (it.get("password") or "").strip()
-        if not a or not pw:
-            continue
-        save_provider({"name": a["name"], "url": a["server_url"], "username": a["username"], "password": pw,
-                       "max_conn": max(1, min(20, a["max_streams"] or 1)), "enabled": a["active"]})
-        added.append(a["name"])
-    if not added:
-        raise ValueError("Nothing imported: enter the password for each account you want to add")
-    log("Imported from Dispatcharr: %s" % ", ".join(added))
-    return {"added": added, "providers": providers_view()}
+    """Add or update the chosen Dispatcharr logins as providers. A password typed in the form wins; otherwise the
+    one Dispatcharr has is used."""
+    logins = {l["key"]: l for l in dispatcharr_logins()}
+    todo = [(logins[it["key"]], (it.get("password") or "").strip()) for it in items or [] if it.get("key") in logins]
+    missing = [l["name"] for l, pw in todo if not (pw or l["password"] or dp_provider(l["key"]))]
+    if missing:  # check everything before changing anything
+        raise ValueError("Dispatcharr has no password for %s yet: type it in, or refresh that account in Dispatcharr"
+                         % ", ".join(missing))
+    done = []
+    for l, pw in todo:
+        pw = pw or l["password"]
+        pr = dp_provider(l["key"])
+        save_provider({"id": pr["id"] if pr else None, "name": pr["name"] if pr else l["name"],
+                       "url": l["server_url"], "username": l["username"] or (pr["username"] if pr else ""),
+                       "password": pw, "max_conn": max(1, min(20, l["max_streams"] or 1)),
+                       "priority": pr["priority"] if pr else 0, "user_agent": pr["user_agent"] if pr else "",
+                       "enabled": l["active"], "source": l["key"]})
+        done.append(l["name"])
+    if not done:
+        raise ValueError("Tick the logins you want to import")
+    log("Imported from Dispatcharr: %s" % ", ".join(done))
+    return done
+
+
+def dispatcharr_mode(data):
+    """The two ways to use Dispatcharr, switched on or off independently."""
+    proxy, imp = bool(data.get("proxy")), bool(data.get("import"))
+    if imp and data.get("logins") is not None:  # first, so a refused import changes nothing
+        dispatcharr_import(data.get("logins"))
+    dispatcharr_self(proxy)
+    for p in list(PROVIDERS.values()):
+        src = p.get("source") or ""
+        if src.startswith("dispatcharr:") and src != DP_SELF:
+            keep = imp and (data.get("logins") is None or any(i.get("key") == src for i in data["logins"]))
+            if bool(p["enabled"]) != keep:
+                save_provider(dict(p, enabled=keep, password=""))
+    save_settings({"dispatcharr_proxy": proxy, "dispatcharr_import": imp})
+    return dict(dispatcharr_connect({}), providers=providers_view())
+
+
+def dispatcharr_refresh():
+    """Before a sync: pick up changed passwords and stream limits from Dispatcharr for the providers it made."""
+    if not (S().get("dispatcharr_url") and S().get("dispatcharr_api_key")) or not any(
+            (p.get("source") or "").startswith("dispatcharr:") and p["enabled"] for p in PROVIDERS.values()):
+        return
+    try:
+        if S().get("dispatcharr_proxy"):
+            dispatcharr_self(True)
+        if S().get("dispatcharr_import"):
+            for l in dispatcharr_logins():
+                pr = dp_provider(l["key"])
+                if not pr or not pr["enabled"] or not l["password"]:
+                    continue
+                limit = max(1, min(20, l["max_streams"] or pr["max_conn"]))
+                if (l["password"], l["username"] or pr["username"], limit) != (pr["password"], pr["username"],
+                                                                                pr["max_conn"]):
+                    save_provider(dict(pr, username=l["username"] or pr["username"], password=l["password"],
+                                       max_conn=limit))
+                    log("Updated %s from Dispatcharr" % pr["name"])
+    except Exception as e:
+        log("Could not refresh logins from Dispatcharr: %s" % e, "warn")
 
 
 # ------------------------------------------------------------------ updates
@@ -7470,18 +7562,25 @@ async function renderSettings(){
       const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="vodgrab-catalog-report.json";document.body.appendChild(a);a.click();a.remove();toast("Report downloaded")}
     catch(x){toast(x.message,1)}b.disabled=false;b.textContent="Download catalog report"};
   const dpDraw=r=>{const box=$("#dpBox");
-    const acc=r.accounts.length?`<div style="margin-top:12px"><b>Import Xtream accounts</b><div class="hint" style="margin:4px 0 8px">Dispatcharr does not share passwords, so enter each account's password. Accounts left blank are skipped.</div>
-      ${r.accounts.map(a=>`<div class="f" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-        <span style="min-width:200px"><b>${esc(a.name)}</b><br><span class="muted">${esc(a.username)} @ ${esc(a.server_url)}${a.max_streams?` · ${a.max_streams} stream${a.max_streams>1?"s":""}`:""}</span></span>
-        ${a.added?`<span class="pill ok">Already a provider</span>`:`<input type="password" data-dpa="${a.id}" placeholder="Password" autocomplete="new-password" style="max-width:220px">`}</div>`).join("")}
-      <button class="btn s" id="dpImport">Import</button></div>`:`<div class="muted" style="margin-top:10px">Dispatcharr has no Xtream accounts to import.</div>`;
-    box.innerHTML=`<div class="sub" style="margin-top:6px">Connected as <b>${esc(r.user)}</b>.</div>
-      <div style="margin-top:10px">${r.self_added?`<span class="pill ok">Dispatcharr is a provider</span> <button class="btn s" id="dpSelf">Update its login</button>`:
-        r.xc_ready?`<button class="btn s p" id="dpSelf">Use Dispatcharr as a provider</button>`:
-        `<span class="muted">To use Dispatcharr as a provider, give your Dispatcharr user an XC password first (Users, edit your user), then press Connect again.</span>`}</div>${acc}`;
-    const sb=$("#dpSelf");if(sb)sb.onclick=async()=>{try{const x=await api("dispatcharr/self",{});drawProvs(x.providers);toast("Dispatcharr saved as a provider. Run a sync to load its catalog.");refreshStatus();dpDraw(await api("dispatcharr"))}catch(e){toast(e.message,1)}};
-    const ib=$("#dpImport");if(ib)ib.onclick=async()=>{const accounts=$$("[data-dpa]",box).map(i=>({id:+i.dataset.dpa,password:i.value})).filter(x=>x.password);
-      try{const x=await api("dispatcharr/import",{accounts});drawProvs(x.providers);toast(`Imported ${x.added.join(", ")}. Run a sync to load the catalog.`);refreshStatus();dpDraw(await api("dispatcharr"))}catch(e){toast(e.message,1)}}};
+    const sp=r.self_provider,n=r.total_streams;
+    const rows=r.logins.map(l=>`<label class="f" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px 26px">
+        <input type="checkbox" data-dpk="${esc(l.key)}" ${l.provider?(l.enabled?"checked":""):(l.has_password&&!l.added?"checked":"")}>
+        <span style="min-width:240px"><b>${esc(l.name)}</b><br><span class="muted">${esc(l.username||"?")} @ ${esc(l.server_url)}${l.max_streams?` · ${l.max_streams} stream${l.max_streams>1?"s":""}`:""}${l.active?"":" · disabled in Dispatcharr"}</span></span>
+        ${l.provider?`<span class="pill ok">${l.enabled?"Imported":"Imported, turned off"}</span>`:l.added?`<span class="pill">Already a provider (added by hand)</span>`:""}
+        ${l.has_password?`<span class="muted">Password from Dispatcharr</span>`:`<input type="password" data-dpp="${esc(l.key)}" placeholder="${l.provider?"Saved, leave blank to keep":"Password"}" autocomplete="new-password" style="max-width:200px">`}</label>`).join("");
+    box.innerHTML=`<div class="sub" style="margin:6px 0 10px">Connected as <b>${esc(r.user)}</b>. Dispatcharr has ${r.logins.length} Xtream login${r.logins.length==1?"":"s"}${n?` with ${n} streams in total`:""}.</div>
+      <div class="f chk"><input type="checkbox" id="dpProxy" ${r.proxy?"checked":""} ${r.xc_ready||r.proxy?"":"disabled"}><label for="dpProxy" style="margin:0;color:var(--text)">Download through Dispatcharr</label></div>
+      <div class="hint" style="margin:0 0 12px 26px">${r.xc_ready?`VODgrab adds Dispatcharr as one provider and downloads through it, so Dispatcharr spreads downloads over your logins and counts them together with live TV.${sp?` VODgrab uses up to ${sp.max_conn} stream${sp.max_conn>1?"s":""} at once; change that on the Dispatcharr provider above.`:""}`:"Your Dispatcharr user needs an XC password first (in Dispatcharr: Users, edit your user). Then press Connect again."}</div>
+      <div class="f chk"><input type="checkbox" id="dpImp" ${r.import?"checked":""}><label for="dpImp" style="margin:0;color:var(--text)">Import Dispatcharr's Xtream logins as providers</label></div>
+      <div class="hint" style="margin:0 0 8px 26px">Each login (every profile counts as its own login) becomes a provider that VODgrab uses directly. Passwords come from Dispatcharr when it has them, and are kept up to date before each sync.</div>
+      <div id="dpRows" ${r.import?"":"hidden"}>${rows||`<div class="muted" style="margin-left:26px">No Xtream logins in Dispatcharr.</div>`}</div>
+      ${r.proxy&&r.import?`<div class="hint" style="margin:6px 0 0;color:var(--acc)">Both are on, so each title is offered twice. The provider order decides which is tried first.</div>`:""}
+      <div class="tools" style="margin-top:10px"><button class="btn s p" id="dpApply">Apply</button></div>`;
+    $("#dpImp").onchange=e=>{$("#dpRows").hidden=!e.target.checked};
+    $("#dpApply").onclick=async()=>{const b=$("#dpApply");b.disabled=true;
+      const logins=$$("[data-dpk]",box).filter(i=>i.checked).map(i=>{const pw=$(`[data-dpp="${CSS.escape(i.dataset.dpk)}"]`,box);return {key:i.dataset.dpk,password:pw?pw.value:""}});
+      try{const x=await api("dispatcharr/mode",{proxy:$("#dpProxy").checked,import:$("#dpImp").checked,logins});drawProvs(x.providers);dpDraw(x);refreshStatus();toast("Dispatcharr settings applied. Run a sync to load new providers' catalogs.")}
+      catch(e){toast(e.message,1)}b.disabled=false}};
   $("#dpConnect").onclick=async()=>{const b=$("#dpConnect");b.disabled=true;$("#dpBox").innerHTML=`<div class="muted">Connecting…</div>`;
     try{dpDraw(await api("dispatcharr",{url:$("#s_dispatcharr_url").value,api_key:$("#s_dispatcharr_api_key").value}))}catch(e){$("#dpBox").innerHTML=`<div class="muted" style="color:var(--bad)">${esc(e.message)}</div>`}b.disabled=false};
   if(SV.settings.dispatcharr_url&&SV.secrets_set.dispatcharr_api_key)api("dispatcharr").then(dpDraw).catch(e=>{$("#dpBox").innerHTML=`<div class="muted" style="color:var(--bad)">${esc(e.message)}</div>`});

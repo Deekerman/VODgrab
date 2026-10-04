@@ -139,10 +139,12 @@ To add VODgrab by hand instead: in Sonarr or Radarr, add a **Newznab** indexer a
 
 ## Dispatcharr
 
-If you use [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr), open **Settings → Dispatcharr**, enter its address (for example `http://dispatcharr:9191`) and an API key (in Dispatcharr: Users, edit your user, API key), and press **Connect**. Then:
+If you use [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr), open **Settings → Dispatcharr**, enter its address (for example `http://dispatcharr:9191`) and an API key (in Dispatcharr: Users, edit your user, API key), and press **Connect**. Then tick how you want to use it and press **Apply**:
 
-- **Use Dispatcharr as a provider:** VODgrab downloads through Dispatcharr's Xtream output, logged in as your Dispatcharr user. Dispatcharr then counts VODgrab's downloads toward each account's connection limit, together with live TV. Your Dispatcharr user needs an XC password, and VOD has to be turned on for the accounts in Dispatcharr.
-- **Import Xtream accounts:** copy Dispatcharr's Xtream accounts into VODgrab as providers. Dispatcharr never shares passwords, so you enter each one once.
+- **Download through Dispatcharr:** VODgrab adds Dispatcharr as one provider and downloads through its Xtream output, logged in as your Dispatcharr user. Dispatcharr spreads the downloads over your logins and counts them together with live TV. Your Dispatcharr user needs an XC password, and VOD has to be turned on for the accounts in Dispatcharr.
+- **Import Dispatcharr's Xtream logins as providers:** every active profile becomes its own provider with its own stream limit. For example, one account with two 5-stream profiles gives VODgrab 10 streams. Passwords come from Dispatcharr once it has refreshed the account, so you only type one if it doesn't have it yet. They are kept up to date before each sync.
+
+Untick either one and press **Apply** to switch its providers off. They are kept, so ticking it again brings them back.
 
 ## Fixing a wrong match
 
