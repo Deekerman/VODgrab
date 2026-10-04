@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -51,7 +51,8 @@ TVDB_BASE = os.environ.get("VODGRAB_TVDB_BASE", "https://api4.thetvdb.com/v4").r
 MB = 1024 * 1024
 GB = 1024 * MB
 
-ALLOWED_INTERVALS = [1, 2, 3, 4, 6, 8, 12, 24, 48, 72, 96, 120, 144, 168]
+ALLOWED_INTERVALS = [6, 8, 12, 24, 48, 72, 96, 120, 144, 168]  # no shorter: a sync re-reads whole catalogs
+RECHECK_HOURS = [0, 1, 2, 4, 6]  # 0 waits for the next scheduled sync
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 REF_MONDAY = dt.date(2024, 1, 1)
 
@@ -95,7 +96,7 @@ DEFAULTS = {
     "windows": [],
     "sync_interval_hours": 24,
     "grace_cycles": 1,
-    "missing_recheck_hours": 6,
+    "missing_recheck_hours": 2,
     "min_score": 90,
     "cleanup_patterns": [],
     "auto_import_manual": True,
@@ -527,6 +528,18 @@ def load_settings():
             up["grace_cycles"] = 1
         save_settings(up)
         ex("INSERT OR REPLACE INTO settings(k, v) VALUES('migrated_1_12', 'true')")
+    if not q1("SELECT 1 FROM settings WHERE k='migrated_1_13_1'"):
+        # 1.13.1: syncs no more often than every 6 hours; rechecks from a short list (the old default 6 becomes 2)
+        up = {}
+        for k in ("sync_interval_hours", "backup_interval_hours"):
+            if to_int(SETTINGS.get(k)) not in ALLOWED_INTERVALS:
+                up[k] = min(ALLOWED_INTERVALS, key=lambda h: abs(h - (to_int(SETTINGS.get(k)) or 24)))
+        rc = to_int(SETTINGS.get("missing_recheck_hours"))
+        if rc == 6 or rc not in RECHECK_HOURS:
+            up["missing_recheck_hours"] = 2 if rc == 6 else min(RECHECK_HOURS, key=lambda h: abs(h - (rc or 0)))
+        if up:
+            save_settings(up)
+        ex("INSERT OR REPLACE INTO settings(k, v) VALUES('migrated_1_13_1', 'true')")
     if not SETTINGS.get("api_key"):
         save_settings({"api_key": secrets.token_hex(16)})
 
@@ -565,8 +578,8 @@ def save_settings(upd):
                 v = max(1, min(50, v or 25))
             if k == "probe_series_open" and v not in ("season", "first", "off"):
                 raise ValueError("TV quality check must be season, first or off")
-            if k == "missing_recheck_hours":
-                v = max(0, min(168, v))
+            if k == "missing_recheck_hours" and v not in RECHECK_HOURS:
+                raise ValueError("Recheck must be one of %s hours (0 is off)" % RECHECK_HOURS)
             if k == "grace_cycles":
                 v = max(0, min(30, v))
             if k == "probe_budget":
@@ -1532,6 +1545,8 @@ def run_sync(trigger="schedule", only=None):
         kept = sum(d["kept_movies"] + d["kept_series"] for d in missing)
         hours = int(S().get("missing_recheck_hours") or 0)
         at = time.time() + hours * 3600 if kept and hours and int(S()["grace_cycles"]) > 0 else 0
+        if at and at >= next_slot(time.time(), S()["sync_interval_hours"]):
+            at = 0  # the next scheduled sync comes first and checks them anyway
         ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_at', ?)", json.dumps(at))
         ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_provs', ?)",
            json.dumps([d["pid"] for d in missing] if at else []))
@@ -7563,7 +7578,7 @@ async function renderSettings(){
   <section class="set"><h3>Catalog sync</h3><div class="fields">
     ${fld("sync_interval_hours","Sync interval","select","Runs start at midnight",SV.intervals.map(h=>[h,ivLabel(h)]))}
     ${fld("grace_cycles","Keep missing titles for this many syncs","number","When a provider stops listing a title, it stays this many more syncs before it is removed")}
-    ${fld("missing_recheck_hours","Check missing titles again after (hours)","number","Runs an extra sync this long after titles go missing, so a title gone twice is removed sooner. 0 waits for the next scheduled sync.")}</div>
+    ${fld("missing_recheck_hours","Check missing titles again","select","An extra sync this long after titles go missing, re-reading only the providers that lost them, so a title gone twice is removed sooner. Only runs if it comes before the next scheduled sync.",[[0,"Off (next scheduled sync)"],[1,"After 1 hour"],[2,"After 2 hours"],[4,"After 4 hours"],[6,"After 6 hours"]])}</div>
     <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button><a class="btn" id="lastChg" download hidden>Download last sync changes</a></div><div id="runs"></div></section>
   <section class="set"><h3>Quality checks</h3>
     <div class="hint muted" style="margin-bottom:10px">When Sonarr or Radarr search, VODgrab reads the header of every copy it is about to offer so the quality it reports is the real one. Copies with different quality become separate releases, and missing files are left out. Each check uses one provider connection for a few seconds and is remembered.</div>

@@ -2,6 +2,12 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.13.1 (2026-10-04)
+
+- **Gentler on providers:** the catalog sync runs at most every 6 hours (the 1 to 4 hour choices are gone; daily stays the default). Installs set below 6 hours move to 6.
+- **Check missing titles again** is now a dropdown: Off, or after 1, 2, 4 or 6 hours, with 2 hours as the default (was 6). It is skipped when the next scheduled sync would come first.
+- Fixed the Catalog sync settings layout (the sync history was squeezed into a narrow column since 1.12.0).
+
 ## 1.13.0 (2026-10-04)
 
 - **Pick the provider inside Dispatcharr:** with **Download through Dispatcharr** on, opening a movie asks Dispatcharr's native API which of its providers have it, and lists each copy with its quality. Leave it on **Dispatcharr picks**, or choose a provider for that download. Dispatcharr still enforces the connection limits. (Episodes still let Dispatcharr choose, since its API has no per-episode provider list.)
