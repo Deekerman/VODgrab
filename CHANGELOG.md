@@ -2,6 +2,10 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.13.0 (2026-10-04)
+
+- **Pick the provider inside Dispatcharr:** with **Download through Dispatcharr** on, opening a movie asks Dispatcharr's native API which of its providers have it, and lists each copy with its quality. Leave it on **Dispatcharr picks**, or choose a provider for that download. Dispatcharr still enforces the connection limits. (Episodes still let Dispatcharr choose, since its API has no per-episode provider list.)
+
 ## 1.12.1 (2026-10-04)
 
 - The missing-titles recheck now only re-reads the catalogs of the providers that had missing titles, instead of every provider.

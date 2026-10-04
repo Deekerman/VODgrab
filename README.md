@@ -144,6 +144,8 @@ If you use [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr), open **Set
 - **Download through Dispatcharr:** VODgrab adds Dispatcharr as one provider and downloads through its Xtream output, logged in as your Dispatcharr user. Dispatcharr spreads the downloads over your logins and counts them together with live TV. Your Dispatcharr user needs an XC password, and VOD has to be turned on for the accounts in Dispatcharr.
 - **Import Dispatcharr's Xtream logins as providers:** every active profile becomes its own provider with its own stream limit. For example, one account with two 5-stream profiles gives VODgrab 10 streams. Passwords come from Dispatcharr once it has refreshed the account, so you only type one if it doesn't have it yet. They are kept up to date before each sync.
 
+With **Download through Dispatcharr** on, a movie's details list every provider copy Dispatcharr has (from its native API). You can let Dispatcharr pick, or choose the provider for that download.
+
 Untick either one and press **Apply** to switch its providers off. They are kept, so ticking it again brings them back.
 
 ## Fixing a wrong match

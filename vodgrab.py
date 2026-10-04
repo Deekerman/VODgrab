@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.12.1"
+VERSION = "1.13.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -2675,7 +2675,7 @@ def add_many(items):
             "failed": sum(1 for r in out if not r["ok"])}
 
 
-def enqueue_manual(kind, xid, season=None, force=False):
+def enqueue_manual(kind, xid, season=None, force=False, dp=None):
     notes = []
     if kind == "movie":
         m = q1("SELECT * FROM movies WHERE id=?", xid)
@@ -2695,6 +2695,9 @@ def enqueue_manual(kind, xid, season=None, force=False):
                     notes.append("Radarr could not identify this movie; it will still download")
             except ArrError as e:
                 notes.append(str(e))
+        if dp and dp.get("account_id") and dp.get("stream_id"):  # a provider picked inside Dispatcharr
+            meta["dp_pref"] = {"cid": xid, "m3u_account_id": to_int(dp["account_id"]), "stream_id": str(dp["stream_id"]),
+                               "account": dp.get("account") or ""}
         j = new_job("manual", "radarr", "movie", xid, m["ext"], movie_release(title, year, m["name"], movie_row(xid)),
                     "%s (%s)" % (title, year) if year else title, meta, force,
                     first_then(xid, movie_sources(xid)))
@@ -2950,6 +2953,9 @@ class Engine:
         name = pname(pid)
         j = job(jid)
         url = stream_url(j["kind"], cid, ext)
+        pref = jmeta(j).get("dp_pref") or {}
+        if pref.get("cid") == cid:  # ask Dispatcharr for the provider copy you picked (it still enforces limits)
+            url += "?" + urllib.parse.urlencode({"m3u_account_id": pref["m3u_account_id"], "stream_id": pref["stream_id"]})
         os.makedirs(folder("incomplete"), exist_ok=True)
         part = os.path.join(folder("incomplete"), "job%d.part" % jid)
         meta = jmeta(j)
@@ -5490,6 +5496,14 @@ def movie_detail(xid):
         if row:
             srcs.append(dict(media_view(row), id=i, provider=pname(dec(i)[0]), name=row["name"], ext=row["ext"],
                              clicked=i == xid))
+    for src in srcs:
+        try:
+            copies = dispatcharr_copies(src["id"])
+        except Exception as e:
+            src["dp_error"] = mask(str(e))
+            continue
+        if copies is not None:
+            src["dp_copies"] = copies
     out["sources"] = srcs
     try:
         out["meta"] = meta_view("movie", m["work"])
@@ -6013,7 +6027,8 @@ class Handler(BaseHTTPRequestHandler):
         if a == "probe" and method == "POST":
             return self.send(200, probe(data.get("kind"), int(data.get("id"))))
         if a == "download" and method == "POST":
-            jobs, notes = enqueue_manual(data.get("kind"), int(data.get("id")), data.get("season"), bool(data.get("now")))
+            jobs, notes = enqueue_manual(data.get("kind"), int(data.get("id")), data.get("season"), bool(data.get("now")),
+                                         data.get("dp"))
             return self.send(200, {"queued": len(jobs), "notes": notes})
         if a == "queue":
             rows = q("SELECT * FROM jobs WHERE status IN ('queued','retry_wait','downloading','verifying','importing') "
@@ -6275,6 +6290,35 @@ def dispatcharr_mode(data):
                 save_provider(dict(p, enabled=keep, password=""))
     save_settings({"dispatcharr_proxy": proxy, "dispatcharr_import": imp})
     return dict(dispatcharr_connect({}), providers=providers_view())
+
+
+DP_COPIES = {}  # catalog id -> (fetched at, copies)
+
+
+def dispatcharr_copies(cid):
+    """For a movie that comes through Dispatcharr: every provider copy Dispatcharr has, from its native VOD API
+    (the Xtream output merges them into one). Each can be picked for a download."""
+    pid, raw = dec(cid)
+    p = PROVIDERS.get(pid)
+    if not p or (p.get("source") or "") != DP_SELF:
+        return None
+    hit = DP_COPIES.get(cid)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    out = []
+    for r in dispatcharr_call("/api/vod/movies/%s/providers/" % raw) or []:
+        if not isinstance(r, dict):
+            continue
+        acc = r.get("m3u_account") if isinstance(r.get("m3u_account"), dict) else {"id": r.get("m3u_account")}
+        qi = r.get("quality_info") or {}
+        quality = qi.get("quality") or qi.get("resolution") or ""
+        if not quality and qi.get("width") and qi.get("height"):
+            quality = "%sx%s" % (qi["width"], qi["height"])
+        out.append({"account_id": acc.get("id"), "account": acc.get("name") or "Account %s" % acc.get("id"),
+                    "stream_id": str(r.get("stream_id") or ""), "ext": r.get("container_extension") or "",
+                    "quality": str(quality)})
+    DP_COPIES[cid] = (time.time(), out)
+    return out
 
 
 def dispatcharr_refresh():
@@ -7244,6 +7288,7 @@ async function openMovie(id){
     ${noMeta(m)}${x.info_error?`<div class="muted">Provider details unavailable: ${esc(x.info_error)}</div>`:""}
     <div class="sec"><h4>Download</h4><div class="srcs" style="margin:0">${x.sources.map(s=>`<div class="src" data-sid="${s.id}"><span class="pn">${esc(s.provider)}</span>${qb(s)}
       <span class="mi" title="${esc(s.name)}">${esc(qinfo(s))} · ${esc(s.ext)}</span>
+      ${s.dp_copies&&s.dp_copies.length?`<select data-dpc title="Which provider Dispatcharr downloads this from" style="max-width:260px"><option value="">Dispatcharr picks (${s.dp_copies.length} cop${s.dp_copies.length==1?"y":"ies"})</option>${s.dp_copies.map((c,i)=>`<option value="${i}">${esc(c.account)}${c.quality?" · "+esc(c.quality):""}${c.ext?" · "+esc(c.ext):""}</option>`).join("")}</select>`:s.dp_error?`<span class="muted" title="${esc(s.dp_error)}">Dispatcharr's copies unavailable</span>`:""}
       ${s.known?"":`<button class="btn s" data-chk>Check quality</button>`}<button class="btn s" data-play>▶ Play</button><button class="btn s p" data-dl>Download</button></div>`).join("")}</div>
       <div class="tools" style="margin:8px 0 0">${nowBox}<span class="muted" style="font-size:12px">${x.sources.length>1?"Starts with the provider you pick and falls back to the others. ":""}Check quality reads the file header for a few seconds.</span></div></div>
     ${x.arr_ok?`<div class="sec" id="linkSec"></div>`:""}
@@ -7251,7 +7296,8 @@ async function openMovie(id){
   wireDetail("movie",m);if(x.arr_ok)drawLinks("movie",id,x.links);
   if($("#addm"))$("#addm").onclick=e=>addArr([{kind:"movie",id}],e.target);
   $$(".src[data-sid]").forEach(r=>{const sid=+r.dataset.sid;
-    $("[data-dl]",r).onclick=async e=>{e.target.disabled=true;await dl({kind:"movie",id:sid,now:$("#now").checked});closeModal()};
+    $("[data-dl]",r).onclick=async e=>{e.target.disabled=true;const src=x.sources.find(y=>y.id==sid)||{},sel=$("[data-dpc]",r);
+      await dl({kind:"movie",id:sid,now:$("#now").checked,dp:sel&&sel.value!==""?src.dp_copies[+sel.value]:null});closeModal()};
     $("[data-play]",r).onclick=()=>{const s=x.sources.find(y=>y.id==sid)||{};play("movie",sid,x.clean+" from "+(s.provider||""),[s.quality,s.codec,s.ext].filter(Boolean).join(" · "))};
     const c=$("[data-chk]",r);if(c)c.onclick=async()=>{const q=await probeIt("movie",sid,c);if(q){c.remove();$(".q",r).outerHTML=qb(q);$(".mi",r).textContent=qinfo(q)}}});
   const todo=status.probe_open?x.sources.filter(s=>s.source!="checked"):[];
