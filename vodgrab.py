@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -94,13 +94,15 @@ DEFAULTS = {
     "on_window_end": "finish",
     "windows": [],
     "sync_interval_hours": 24,
-    "grace_cycles": 3,
+    "grace_cycles": 1,
+    "missing_recheck_hours": 6,
     "min_score": 90,
     "cleanup_patterns": [],
     "auto_import_manual": True,
     "default_quality": "1080p",
     "probe_on_search": True,
     "probe_on_open": True,
+    "probe_series_open": "season",
     "show_adult": False,
     "wanted_auto_search": False,
     "category_map": [],
@@ -517,6 +519,14 @@ def load_settings():
             pass
     SETTINGS.clear()
     SETTINGS.update(s)
+    if not q1("SELECT 1 FROM settings WHERE k='migrated_1_12'"):
+        # 1.12.0: missing titles are kept for 1 sync (was 3) and checked again sooner; TV quality checks on open
+        # get their own setting, starting from what movies use
+        up = {"probe_series_open": "season" if SETTINGS.get("probe_on_open") else "off"}
+        if SETTINGS.get("grace_cycles") == 3:
+            up["grace_cycles"] = 1
+        save_settings(up)
+        ex("INSERT OR REPLACE INTO settings(k, v) VALUES('migrated_1_12', 'true')")
     if not SETTINGS.get("api_key"):
         save_settings({"api_key": secrets.token_hex(16)})
 
@@ -553,6 +563,12 @@ def save_settings(upd):
                 raise ValueError("Sync interval must be one of %s hours" % ALLOWED_INTERVALS)
             if k.endswith("_indexer_priority"):
                 v = max(1, min(50, v or 25))
+            if k == "probe_series_open" and v not in ("season", "first", "off"):
+                raise ValueError("TV quality check must be season, first or off")
+            if k == "missing_recheck_hours":
+                v = max(0, min(168, v))
+            if k == "grace_cycles":
+                v = max(0, min(30, v))
             if k == "probe_budget":
                 v = max(5, min(90, v))
             if k == "probe_max_age_days":
@@ -1507,6 +1523,13 @@ def run_sync(trigger="schedule"):
            err or None, tot["added_movies"], tot["added_series"], tot["removed_movies"], tot["removed_series"],
            json.dumps([{k: v for k, v in d.items() if k != "titles"} for d in detail]), run_id)
         log("Catalog sync done: %s%s" % (sync_summary(tot), ("; errors: " + err) if err else ""))
+        kept = sum(d.get("kept_movies", 0) + d.get("kept_series", 0) for d in detail)
+        hours = int(S().get("missing_recheck_hours") or 0)
+        at = time.time() + hours * 3600 if kept and hours and int(S()["grace_cycles"]) > 0 else 0
+        ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_at', ?)", json.dumps(at))
+        if at:
+            log("%d title%s missing from the providers; checking again at %s" % (
+                kept, "" if kept == 1 else "s", time.strftime("%Y-%m-%d %H:%M", time.localtime(at))))
         try:
             write_sync_changes(run_id, started, trigger, detail, tot, err)
         except OSError as e:
@@ -2258,9 +2281,10 @@ def ensure_probed(items, budget=None, force=False):
 def probe_open(items):
     """Quality checks when a title is opened: every listed copy without a recent check, using free connections
     only, for up to 40 seconds. Returns what is known now for each copy."""
-    if not FFPROBE or not S().get("probe_on_open"):
+    if not FFPROBE:
         return {}
-    pairs = [(k if k == "movie" else "episode", int(c)) for k, c in items or [] if k in ("movie", "episode")][:60]
+    ok = {"movie": bool(S().get("probe_on_open")), "episode": S().get("probe_series_open", "season") != "off"}
+    pairs = [(k, int(c)) for k, c in items or [] if ok.get(k)][:60]
     ensure_probed(pairs, budget=40, force=True)
     out = {}
     for kind, cid in pairs:
@@ -2383,6 +2407,12 @@ def scheduler():
                 last = slot
                 if active_providers():
                     threading.Thread(target=run_sync, args=("schedule",), daemon=True).start()
+            else:
+                r = q1("SELECT v FROM settings WHERE k='recheck_at'")
+                at = json.loads(r["v"]) if r else 0
+                if at and time.time() >= at and not SYNC["running"] and active_providers():
+                    ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_at', '0')")
+                    threading.Thread(target=run_sync, args=("recheck",), daemon=True).start()
         except Exception:
             log(traceback.format_exc(), "error")
 
@@ -3792,10 +3822,12 @@ def status_view():
     return {"version": VERSION, "update": UPDATE["latest"] if UPDATE["latest"] and vtuple(UPDATE["latest"]) >
             vtuple(VERSION) else "", "configured": bool(active_providers()), "paused": s["paused"], "banner": ENGINE.banner, "prov_error": bool(ENGINE.prov_errors), "arrs": {"radarr": RADARR.ok(), "sonarr": SONARR.ok()},
             "ffprobe": bool(FFPROBE), "fts": FTS, "probe_open": bool(FFPROBE and s.get("probe_on_open")),
+            "probe_series": s.get("probe_series_open", "season") if FFPROBE else "off",
             "window": {"enabled": s["schedule_enabled"] and bool(s["windows"]), "open": in_win, "concurrency": conc},
             "sync": {"running": SYNC["running"], "phase": SYNC["phase"], "error": SYNC["error"],
                      "last": dict(last) if last else None,
-                     "next": next_slot(time.time(), s["sync_interval_hours"])},
+                     "next": next_slot(time.time(), s["sync_interval_hours"]),
+                     "recheck": json.loads((q1("SELECT v FROM settings WHERE k='recheck_at'") or {"v": "0"})["v"])},
             "counts": {"movies": q1("SELECT COUNT(*) c FROM movies")["c"],
                        "series": q1("SELECT COUNT(*) c FROM series")["c"],
                        "active": q1("SELECT COUNT(*) c FROM jobs WHERE status IN ('queued','retry_wait','downloading',"
@@ -6887,7 +6919,8 @@ async function refreshStatus(){try{status=await api("status")}catch(e){return}
   const s=status.sync;let txt;
   if(s.running)txt="Syncing "+(s.phase||"").toLowerCase();
   else if(s.error)txt="Sync failed";
-  else txt=s.last?`Synced ${ago(s.last.finished)} · next ${when(s.next)}`:`Next sync ${when(s.next)}`;
+  else{const rc=s.recheck&&s.recheck<s.next,nx=rc?s.recheck:s.next;
+    txt=s.last?`Synced ${ago(s.last.finished)} · ${rc?"recheck":"next"} ${when(nx)}`:`Next sync ${when(nx)}`}
   const ps=$("#pSync");ps.textContent=txt;ps.className="pill"+(s.error&&!s.running?" bad":s.running?" warn":"");ps.title=s.error||"";
   const w=status.window,pw=$("#pWin");
   if(status.paused){pw.textContent="Paused";pw.className="pill warn"}
@@ -7229,8 +7262,9 @@ async function openSeries(id){
       <div class="ea">${e.missing?`<span class="muted" style="font-size:12px">Not on your providers</span>`:`<span title="${esc(qinfo(e.media))}">${e.checking?`<span class="q unk checking" title="Checking quality">…</span>`:qb(e.media)}</span>${e.media.missing?`<span style="color:var(--bad);font-size:12px">Missing on the provider</span>`:""}${e.media.known?`<span class="em">${esc([e.media.codec,dur(e.media.duration),e.media.size?fb(e.media.size):""].filter(Boolean).join(" · "))}</span>`:""}${e.job?st(e.job):""}
         ${e.media.known||e.checking?"":`<button class="btn s" data-c="${e.id}">Check quality</button>`}<button class="btn s" data-pl="${e.id}">▶ Play</button><button class="btn s p" data-e="${e.id}">Download</button>`}</div></div></div>`};
   const probed=new Set();
-  const checkSeason=async se=>{if(!status.probe_open||probed.has(se.season))return;probed.add(se.season);
-    const todo=se.episodes.filter(e=>e.id&&!e.missing&&e.media.source!="checked");if(!todo.length)return;
+  const checkSeason=async se=>{const how=status.probe_series||"off";if(how=="off"||probed.has(se.season))return;probed.add(se.season);
+    const avail=se.episodes.filter(e=>e.id&&!e.missing);
+    const todo=(how=="first"?avail.slice(0,1):avail).filter(e=>e.media.source!="checked");if(!todo.length)return;
     todo.forEach(e=>e.checking=true);
     let res={};try{res=await api("probe/open",{items:todo.map(e=>["episode",e.id])})}catch(err){}
     todo.forEach(e=>{e.checking=false;if(res[e.id])e.media=res[e.id]});if(cur==se.season&&$("#eps"))draw()};
@@ -7471,13 +7505,15 @@ async function renderSettings(){
     <div class="hint muted" style="margin-top:6px">Windows can cross midnight. Download now on a queue item ignores the schedule.</div></section>
   <section class="set"><h3>Catalog sync</h3><div class="fields">
     ${fld("sync_interval_hours","Sync interval","select","Runs start at midnight",SV.intervals.map(h=>[h,ivLabel(h)]))}
-    ${fld("grace_cycles","Keep missing titles for this many syncs","number")}</div>
+    ${fld("grace_cycles","Keep missing titles for this many syncs","number","When a provider stops listing a title, it stays this many more syncs before it is removed")}
+    ${fld("missing_recheck_hours","Check missing titles again after (hours)","number","Runs an extra sync this long after titles go missing, so a title gone twice is removed sooner. 0 waits for the next scheduled sync.")}</div>
     <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button><a class="btn" id="lastChg" download hidden>Download last sync changes</a></div><div id="runs"></div></section>
   <section class="set"><h3>Quality checks</h3>
     <div class="hint muted" style="margin-bottom:10px">When Sonarr or Radarr search, VODgrab reads the header of every copy it is about to offer so the quality it reports is the real one. Copies with different quality become separate releases, and missing files are left out. Each check uses one provider connection for a few seconds and is remembered.</div>
     <div class="fields">
     ${fld("probe_on_search","Check quality when Sonarr or Radarr search","bool")}
-    ${fld("probe_on_open","Check quality when you open a title","bool","Checks every copy of a movie, or the season you are looking at, that hasn't been checked yet. Uses free connections only, so downloads are never interrupted.")}
+    ${fld("probe_series_open","TV: check quality when you open a series","select","Whole season checks every episode of the season you are looking at",[["season","Whole season"],["first","First episode only"],["off","Don't check"]])}
+    ${fld("probe_on_open","Movies: check quality when you open a movie","bool","Checks every copy of the movie that hasn't been checked yet. Both checks use free connections only, so downloads are never interrupted.")}
     ${fld("probe_budget","Time allowed per search (seconds)","number","Checks that don't finish in time run in the background for the next search. Keep under 60 so the arrs don't time out.")}
     ${fld("probe_max_age_days","Recheck a file after this many days","number")}</div></section>
   <section class="set"><h3>Browsing</h3><div class="fields">

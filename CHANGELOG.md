@@ -2,6 +2,11 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.12.0 (2026-10-04)
+
+- **Quality checks when opening, split by type:** movies have their own on/off switch, and TV has **Whole season**, **First episode only** or **Don't check**.
+- **Missing titles:** kept for 1 sync by default (was 3; installs still on the old default are moved to 1). New **Check missing titles again after (hours)**, default 6: when titles go missing, an extra sync runs that many hours later, and a title still gone is removed. The header shows when the recheck is due.
+
 ## 1.11.0 (2026-10-04)
 
 - **Dispatcharr:** two checkboxes, **Download through Dispatcharr** and **Import Dispatcharr's Xtream logins as providers**. Use either or both, and turn each off again (its providers are switched off, not deleted).
