@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -238,7 +238,8 @@ CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, nzo TEXT U
   hidden INTEGER DEFAULT 0, meta TEXT DEFAULT '{}', created REAL, updated REAL, started REAL, finished REAL);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS sync_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, finished REAL,
-  movies INTEGER, series INTEGER, removed INTEGER, ok INTEGER, error TEXT, trigger TEXT);
+  movies INTEGER, series INTEGER, removed INTEGER, ok INTEGER, error TEXT, trigger TEXT, added_movies INTEGER,
+  added_series INTEGER, removed_movies INTEGER, removed_series INTEGER, detail TEXT);
 """
 
 
@@ -271,6 +272,11 @@ def init_db():
         ex("ALTER TABLE jobs ADD COLUMN sources TEXT DEFAULT '[]'")
     if "prov" not in cols:
         ex("ALTER TABLE jobs ADD COLUMN prov INTEGER DEFAULT 0")
+    have = {r["name"] for r in q("PRAGMA table_info(sync_runs)")}
+    for col, typ in (("added_movies", "INTEGER"), ("added_series", "INTEGER"), ("removed_movies", "INTEGER"),
+                     ("removed_series", "INTEGER"), ("detail", "TEXT")):
+        if col not in have:
+            ex("ALTER TABLE sync_runs ADD COLUMN %s %s" % (col, typ))
     migrate()
     db().executescript(CATALOG)
     for t in ("movies", "episodes"):
@@ -1323,12 +1329,16 @@ def run_sync(trigger="schedule"):
         if not provs:
             raise RuntimeError("No enabled providers")
         log("Catalog sync started (%s)" % trigger)
-        tot_m = tot_s = removed = 0
+        keys = ("movies", "series", "added_movies", "added_series", "removed_movies", "removed_series")
+        tot = dict.fromkeys(keys, 0)
+        detail = []
         errors = []
         for p in provs:
             try:
-                m, s, r = sync_provider(p, started)
-                tot_m, tot_s, removed = tot_m + m, tot_s + s, removed + r
+                res = sync_provider(p, started)
+                detail.append(res)
+                for k in keys:
+                    tot[k] += res[k]
             except Exception as e:
                 errors.append("%s: %s" % (p["name"], mask(str(e))))
                 log("Catalog sync failed for %s: %s" % (p["name"], e), "error")
@@ -1343,10 +1353,12 @@ def run_sync(trigger="schedule"):
         err = "; ".join(errors)
         ok = len(errors) < len(provs)
         SYNC["error"] = err
-        ex("UPDATE sync_runs SET finished=?, movies=?, series=?, removed=?, ok=?, error=? WHERE id=?",
-           time.time(), tot_m, tot_s, removed, 1 if ok else 0, err or None, run_id)
-        log("Catalog sync done: %d movies, %d series, %d removed%s" % (tot_m, tot_s, removed,
-                                                                      ("; errors: " + err) if err else ""))
+        ex("UPDATE sync_runs SET finished=?, movies=?, series=?, removed=?, ok=?, error=?, added_movies=?, "
+           "added_series=?, removed_movies=?, removed_series=?, detail=? WHERE id=?",
+           time.time(), tot["movies"], tot["series"], tot["removed_movies"] + tot["removed_series"], 1 if ok else 0,
+           err or None, tot["added_movies"], tot["added_series"], tot["removed_movies"], tot["removed_series"],
+           json.dumps(detail), run_id)
+        log("Catalog sync done: %s%s" % (sync_summary(tot), ("; errors: " + err) if err else ""))
         return ok
     except Exception as e:
         SYNC["error"] = mask(str(e))
@@ -1397,6 +1409,10 @@ def sync_provider(p, started):
     SYNC["phase"] = "%s saving" % name
     gen = int(started)
     grace = int(S()["grace_cycles"])
+    for label, items, table in (("movies", movies, "movies"), ("series", series, "series")):
+        had = q1("SELECT COUNT(*) c FROM %s WHERE prov=? AND missing=0" % table, pid)["c"]
+        if not items and had > 100:
+            log("%s returned 0 %s (had %d); keeping them for up to %d more syncs" % (name, label, had, grace), "warn")
     initial = bool(q1("SELECT 1 FROM settings WHERE k='needs_resync'")) or not q1(
         "SELECT 1 FROM movies WHERE prov=? UNION ALL SELECT 1 FROM series WHERE prov=? LIMIT 1", pid, pid)
     now = int(time.time())
@@ -1458,6 +1474,8 @@ def sync_provider(p, started):
     c = db()
     c.execute("BEGIN")
     try:
+        before_m = c.execute("SELECT COUNT(*) FROM movies WHERE prov=?", (pid,)).fetchone()[0]
+        before_s = c.execute("SELECT COUNT(*) FROM series WHERE prov=?", (pid,)).fetchone()[0]
         c.execute("DELETE FROM categories WHERE prov=?", (pid,))
         c.executemany("INSERT OR REPLACE INTO categories(kind, id, name, prov, grp, canon) VALUES(?,?,?,?,?,?)", cats)
         c.executemany("""INSERT INTO movies(id, prov, name, clean, norm, year, tmdb, ext, cat, icon, rating, added, gen,
@@ -1482,10 +1500,13 @@ def sync_provider(p, started):
             rating_n=COALESCE(excluded.rating_n, series.rating_n),
             first_seen=COALESCE(series.first_seen, excluded.first_seen), work=excluded.work, srch=excluded.srch,
             missing=0""", srows)
+        count = "SELECT COUNT(*) FROM %s WHERE prov=?"
+        added_m = c.execute(count % "movies", (pid,)).fetchone()[0] - before_m
+        added_s = c.execute(count % "series", (pid,)).fetchone()[0] - before_s
         c.execute("UPDATE movies SET missing=missing+1 WHERE prov=? AND gen<>?", (pid, gen))
         c.execute("UPDATE series SET missing=missing+1 WHERE prov=? AND gen<>?", (pid, gen))
-        removed = c.execute("DELETE FROM movies WHERE prov=? AND missing>?", (pid, grace)).rowcount
-        removed += c.execute("DELETE FROM series WHERE prov=? AND missing>?", (pid, grace)).rowcount
+        removed_m = c.execute("DELETE FROM movies WHERE prov=? AND missing>?", (pid, grace)).rowcount
+        removed_s = c.execute("DELETE FROM series WHERE prov=? AND missing>?", (pid, grace)).rowcount
         c.execute("DELETE FROM episodes WHERE prov=? AND series_id NOT IN (SELECT id FROM series)", (pid,))
         if FTS:
             lo, hi = pid * SCALE, (pid + 1) * SCALE
@@ -1499,8 +1520,15 @@ def sync_provider(p, started):
     for r in q("SELECT id FROM movies WHERE prov=? AND qual IS NULL AND (width IS NOT NULL OR id IN "
                "(SELECT id FROM probes WHERE error IS NULL))", pid):
         set_qual("movies", r["id"])
-    log("%s: %d movies, %d series" % (name, len(mrows), len(srows)))
-    return len(mrows), len(srows), removed
+    res = {"provider": name, "movies": len(mrows), "series": len(srows), "added_movies": added_m,
+           "added_series": added_s, "removed_movies": removed_m, "removed_series": removed_s}
+    log("%s: %s" % (name, sync_summary(res)))
+    return res
+
+
+def sync_summary(r):
+    return "%d movies (+%d new, %d removed), %d series (+%d new, %d removed)" % (
+        r["movies"], r["added_movies"], r["removed_movies"], r["series"], r["added_series"], r["removed_series"])
 
 
 def ensure_episodes(sid, max_age=12 * 3600):
@@ -2138,6 +2166,8 @@ def scheduler():
                 continue
             if FOLDER_ERRORS and int(time.time()) % 300 < 15:
                 ensure_dirs()
+            if int(time.time()) % 600 < 15:
+                import_checks()
             slot = prev_slot(time.time(), h)
             if slot > last:
                 last = slot
@@ -2167,7 +2197,8 @@ def jmeta(j):
         return {}
 
 
-def new_job(source, arr, kind, xid, ext, release, label, meta, force=False, sources=None):
+def new_job(source, arr, kind, xid, ext, release, label, meta, force=False, sources=None, reuse=None):
+    """Queue a download. With reuse (an earlier completed job), the new job points at that job's file instead."""
     sources = [list(x) for x in (sources or [(xid, ext)])]
     xid, ext = sources[0]
     same = q1("SELECT * FROM jobs WHERE source=? AND kind=? AND release=? AND status IN (%s)"
@@ -2180,11 +2211,16 @@ def new_job(source, arr, kind, xid, ext, release, label, meta, force=False, sour
     pos = ((r["p"] or 0) + 1)
     nzo = "SABnzbd_nzo_" + secrets.token_hex(6)
     t = time.time()
+    status, path, total, finished = "queued", "", 0, None
+    if reuse:
+        status, path, total, finished = "completed", reuse["path"], reuse["total"] or 0, t
+        meta = dict(meta or {}, probe=jmeta(reuse).get("probe"), reused=reuse["id"])
     jid = ex("INSERT INTO jobs(nzo, source, arr, kind, xid, ext, release, label, status, pos, force, meta, created, "
-             "updated, sources, prov) VALUES(?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?,?)", nzo, source, arr, kind, xid, ext,
-             release, label, pos, 1 if force else 0, json.dumps(meta or {}), t, t, json.dumps(sources),
-             dec(xid)[0]).lastrowid
-    log("Queued %s (%s, %d source%s)" % (release, source, len(sources), "" if len(sources) == 1 else "s"))
+             "updated, sources, prov, path, total, done, started, finished) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             nzo, source, arr, kind, xid, ext, release, label, status, pos, 1 if force else 0, json.dumps(meta or {}),
+             t, t, json.dumps(sources), dec(xid)[0], path, total, total, finished, finished).lastrowid
+    if not reuse:
+        log("Queued %s (%s, %d source%s)" % (release, source, len(sources), "" if len(sources) == 1 else "s"))
     return job(jid)
 
 
@@ -3203,9 +3239,52 @@ def sab_add(payload, cat):
     meta = {k: p.get(k) for k in ("tvdb", "season", "ep", "tmdb") if p.get(k) is not None}
     src = [[int(c), e] for c, e in (p.get("src") or [[p["xid"], p.get("ext") or "mkv"]])]
     src = [x for x in src if dec(x[0])[0] in PROVIDERS] or src
+    prev = earlier_copy(arr, p["kind"], [x[0] for x in src], p["title"])
     j = new_job("arr", arr, p["kind"], src[0][0], src[0][1], p["title"], p.get("label") or p["title"], meta,
-                sources=src)
+                sources=src, reuse=prev)
+    if prev and j["status"] == "completed":
+        upd(prev["id"], hidden=1)
+        log("%s grabbed %s again; reusing the copy downloaded %s instead of downloading it again" % (
+            arr.title(), p["title"], time.strftime("%Y-%m-%d %H:%M", time.localtime(prev["finished"] or prev["updated"]))),
+            "warn")
+        threading.Thread(target=import_check, args=(j["id"], True), daemon=True).start()
     return j["nzo"]
+
+
+def earlier_copy(arr, kind, xids, release):
+    """A finished download of the same stream the arr has not imported yet (its file is still in place)."""
+    rows = q("SELECT * FROM jobs WHERE source='arr' AND arr=? AND kind=? AND status='completed' AND path<>'' AND "
+             "(release=? OR xid IN (%s)) ORDER BY finished DESC" % ",".join("?" * len(xids)), arr, kind, release, *xids)
+    for r in rows:
+        if os.path.isfile(r["path"]):
+            return r
+    return None
+
+
+def import_check(jid, now=False):
+    """Log once why Radarr or Sonarr has not imported a finished download, using the arr's own rejection reasons."""
+    j = job(jid)
+    if not j or j["status"] != "completed" or not j["path"] or not os.path.isfile(j["path"]):
+        return
+    meta = jmeta(j)
+    if meta.get("import_checked"):
+        return
+    arr = ARR(j["arr"])
+    reason = ENGINE.rejections(arr, j["path"]) if arr.ok() else ""
+    meta["import_checked"] = time.time()
+    if reason:
+        meta["import_reason"] = reason
+    ex("UPDATE jobs SET meta=?, error=? WHERE id=?", json.dumps(meta), "%s: %s" % (arr.label, reason) if reason else "", jid)
+    log("%s has not imported %s%s: %s" % (
+        arr.label, j["release"], "" if now else " after 30 minutes",
+        reason or "no reason given; check %s's Activity page" % arr.label), "warn")
+
+
+def import_checks():
+    cutoff = time.time() - 30 * 60
+    for r in q("SELECT id FROM jobs WHERE source='arr' AND hidden=0 AND status='completed' AND finished<? AND "
+               "finished>? AND meta NOT LIKE '%import_checked%'", cutoff, time.time() - 14 * 86400):
+        import_check(r["id"])
 
 
 def fmt_left(secs):
@@ -3242,13 +3321,21 @@ def sab_queue(cat):
                       "timeleft": "0:00:00", "mb": "0", "mbleft": "0", "diskspace1": "100", "diskspace2": "100"}}
 
 
-def sab_history(cat, limit):
-    rows = q("SELECT * FROM jobs WHERE source='arr' AND hidden=0 AND status IN ('completed','imported','failed') "
-             "ORDER BY updated DESC LIMIT ?", limit)
+def sab_history(cat, limit, start=0):
+    # Filter by category before the limit: Radarr asks for 60 items, and a busy Sonarr would otherwise push
+    # Radarr's downloads out of its view before they are imported, so Radarr forgets them and grabs again.
+    where, args = "source='arr' AND hidden=0", []
+    if cat and cat != "*":
+        where += " AND arr=?"
+        args.append(cat)
+    rows = q("SELECT * FROM jobs WHERE %s AND status IN ('completed','imported','failed') "
+             "ORDER BY updated DESC LIMIT ? OFFSET ?" % where, *(args + [limit, start]))
+    # Downloads still waiting for import always stay visible, so the arr keeps tracking them.
+    seen = {j["id"] for j in rows}
+    rows += [j for j in q("SELECT * FROM jobs WHERE %s AND status='completed' AND finished>? ORDER BY updated DESC"
+                          % where, *(args + [time.time() - 14 * 86400])) if j["id"] not in seen]
     slots = []
     for j in rows:
-        if cat and cat != "*" and j["arr"] != cat:
-            continue
         ok = j["status"] in ("completed", "imported")
         slots.append({"fail_message": "" if ok else (j["error"] or "Download failed"), "bytes": j["total"] or 0,
                       "category": j["arr"], "nzb_name": j["release"] + ".nzb",
@@ -5423,7 +5510,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"status": True})
             if mode == "queue":
                 return self.send(200, sab_queue(cat))
-            return self.send(200, sab_history(cat, int(qs.get("limit") or 100)))
+            return self.send(200, sab_history(cat, int(qs.get("limit") or 100), int(qs.get("start") or 0)))
         if mode in ("pause", "resume", "change_cat", "switch", "retry", "change_opts", "set_config"):
             return self.send(200, {"status": True})
         self.send(200, {"status": False, "error": "Not supported: %s" % mode})
@@ -6702,7 +6789,8 @@ async function renderSettings(){
       const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="vodgrab-catalog-report.json";document.body.appendChild(a);a.click();a.remove();toast("Report downloaded")}
     catch(x){toast(x.message,1)}b.disabled=false;b.textContent="Download catalog report"};
   $("#logBtn").onclick=async()=>{const l=await api("logs");out("log",l.slice().reverse().join("\n")||"Empty")};
-  const runs=async()=>{const r=await api("syncruns");$("#runs").innerHTML=r.length?`<div class="list" style="margin-top:10px">${r.slice(0,6).map(x=>`<div class="sub">${new Date(x.started*1000).toLocaleString()} · ${esc(x.trigger)} · ${x.finished==null?"running":x.ok?`${x.movies} movies, ${x.series} series, ${x.removed} removed`:"failed: "+esc(x.error)}</div>`).join("")}</div>`:""};runs();
+function runSum(x){return x.added_movies==null?`${x.movies} movies, ${x.series} series, ${x.removed} removed`:`${x.movies} movies (+${x.added_movies} new, ${x.removed_movies} removed), ${x.series} series (+${x.added_series} new, ${x.removed_series} removed)`}
+  const runs=async()=>{const r=await api("syncruns");$("#runs").innerHTML=r.length?`<div class="list" style="margin-top:10px">${r.slice(0,6).map(x=>`<div class="sub">${new Date(x.started*1000).toLocaleString()} · ${esc(x.trigger)} · ${x.finished==null?"running":x.ok?runSum(x):"failed: "+esc(x.error)}</div>${x.ok&&x.detail?JSON.parse(x.detail).map(d=>`<div class="sub" style="padding-left:14px">${esc(d.provider)}: ${runSum(d)}</div>`).join(""):""}`).join("")}</div>`:""};runs();
   async function save(quiet){readWins();const body={};
     for(const el of $$("#main [id^=s_]")){const k=el.id.slice(2);if(el.type=="checkbox")body[k]=el.checked;else if(el.tagName=="TEXTAREA")body[k]=el.value.split("\n").map(x=>x.trim()).filter(Boolean);else body[k]=el.value}
     body.retry_backoff=String(body.retry_backoff).split(",").map(x=>x.trim()).filter(Boolean);body.windows=wins;
