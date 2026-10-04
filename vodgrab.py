@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -1480,7 +1480,8 @@ _sync_lock = threading.Lock()
 _ep_locks = collections.defaultdict(threading.Lock)
 
 
-def run_sync(trigger="schedule"):
+def run_sync(trigger="schedule", only=None):
+    """Sync every enabled provider's catalog, or only the providers in only (a recheck of missing titles)."""
     if not _sync_lock.acquire(blocking=False):
         return False
     run_id = None
@@ -1490,9 +1491,12 @@ def run_sync(trigger="schedule"):
         run_id = ex("INSERT INTO sync_runs(started, trigger) VALUES(?, ?)", started, trigger).lastrowid
         dispatcharr_refresh()
         provs = active_providers()
+        if only:
+            provs = [p for p in provs if p["id"] in only] or provs
         if not provs:
             raise RuntimeError("No enabled providers")
-        log("Catalog sync started (%s)" % trigger)
+        log("Catalog sync started (%s)" % trigger if not only else "Catalog sync started (%s: %s)" % (
+            trigger, ", ".join(p["name"] for p in provs)))
         keys = ("movies", "series", "added_movies", "added_series", "removed_movies", "removed_series")
         tot = dict.fromkeys(keys, 0)
         detail = []
@@ -1523,13 +1527,18 @@ def run_sync(trigger="schedule"):
            err or None, tot["added_movies"], tot["added_series"], tot["removed_movies"], tot["removed_series"],
            json.dumps([{k: v for k, v in d.items() if k != "titles"} for d in detail]), run_id)
         log("Catalog sync done: %s%s" % (sync_summary(tot), ("; errors: " + err) if err else ""))
-        kept = sum(d.get("kept_movies", 0) + d.get("kept_series", 0) for d in detail)
+        # Providers whose lists left titles missing get a recheck of just their lists later
+        missing = [d for d in detail if d.get("kept_movies", 0) + d.get("kept_series", 0)]
+        kept = sum(d["kept_movies"] + d["kept_series"] for d in missing)
         hours = int(S().get("missing_recheck_hours") or 0)
         at = time.time() + hours * 3600 if kept and hours and int(S()["grace_cycles"]) > 0 else 0
         ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_at', ?)", json.dumps(at))
+        ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_provs', ?)",
+           json.dumps([d["pid"] for d in missing] if at else []))
         if at:
-            log("%d title%s missing from the providers; checking again at %s" % (
-                kept, "" if kept == 1 else "s", time.strftime("%Y-%m-%d %H:%M", time.localtime(at))))
+            log("%d title%s missing from %s; checking %s again at %s" % (
+                kept, "" if kept == 1 else "s", ", ".join(d["provider"] for d in missing),
+                "it" if len(missing) == 1 else "them", time.strftime("%Y-%m-%d %H:%M", time.localtime(at))))
         try:
             write_sync_changes(run_id, started, trigger, detail, tot, err)
         except OSError as e:
@@ -1700,7 +1709,7 @@ def sync_provider(p, started):
     for r in q("SELECT id FROM movies WHERE prov=? AND qual IS NULL AND (width IS NOT NULL OR id IN "
                "(SELECT id FROM probes WHERE error IS NULL))", pid):
         set_qual("movies", r["id"])
-    res = {"provider": name, "movies": len(mrows), "series": len(srows),
+    res = {"provider": name, "pid": pid, "movies": len(mrows), "series": len(srows),
            "added_movies": len(added["movie"]), "added_series": len(added["series"]),
            "removed_movies": len(removed["movie"]), "removed_series": len(removed["series"]),
            "kept_movies": kept["movie"], "kept_series": kept["series"],
@@ -2412,7 +2421,9 @@ def scheduler():
                 at = json.loads(r["v"]) if r else 0
                 if at and time.time() >= at and not SYNC["running"] and active_providers():
                     ex("INSERT OR REPLACE INTO settings(k, v) VALUES('recheck_at', '0')")
-                    threading.Thread(target=run_sync, args=("recheck",), daemon=True).start()
+                    r = q1("SELECT v FROM settings WHERE k='recheck_provs'")
+                    only = [int(x) for x in json.loads(r["v"])] if r else []
+                    threading.Thread(target=run_sync, args=("recheck", only), daemon=True).start()
         except Exception:
             log(traceback.format_exc(), "error")
 

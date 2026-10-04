@@ -2,6 +2,10 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.12.1 (2026-10-04)
+
+- The missing-titles recheck now only re-reads the catalogs of the providers that had missing titles, instead of every provider.
+
 ## 1.12.0 (2026-10-04)
 
 - **Quality checks when opening, split by type:** movies have their own on/off switch, and TV has **Whole season**, **First episode only** or **Don't check**.
