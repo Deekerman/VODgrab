@@ -2,6 +2,10 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.9.1 (2026-10-04)
+
+- App icon in the browser tab, and for shortcuts added to a phone's home screen.
+
 ## 1.9.0 (2026-10-04)
 
 - **Download all logs:** VODgrab now keeps its log in `data/logs/` (up to about 25 MB) and Settings → Log has a **Download all logs** button.
