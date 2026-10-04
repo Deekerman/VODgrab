@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -123,6 +123,7 @@ DEFAULTS = {
     "backup_meta": True,
     "backup_catalog": True,
     "backup_path": "",
+    "update_check": True,
 }
 SECRET_KEYS = ("sonarr_api_key", "radarr_api_key", "web_password", "tmdb_key", "omdb_key", "tvdb_key", "tvdb_pin")
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
@@ -160,10 +161,35 @@ def mask(s):
     return s
 
 
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "vodgrab.log")
+LOG_MAX = 5 * MB
+LOG_KEEP = 4  # rotated files, vodgrab.log.1 (newest) to vodgrab.log.4
+_log_lock = threading.Lock()
+
+
 def log(msg, level="info"):
     line = "%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), level, mask(msg))
     LOG.append(line)
     print(line, flush=True)
+    with _log_lock:
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= LOG_MAX:
+                for i in range(LOG_KEEP, 0, -1):
+                    src = LOG_FILE + (".%d" % (i - 1) if i > 1 else "")
+                    if os.path.exists(src):
+                        os.replace(src, "%s.%d" % (LOG_FILE, i))
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def log_files():
+    """All log files, oldest first."""
+    names = ["%s.%d" % (LOG_FILE, i) for i in range(LOG_KEEP, 0, -1)] + [LOG_FILE]
+    return [n for n in names if os.path.exists(n)]
 
 
 # ------------------------------------------------------------------ database
@@ -1357,8 +1383,12 @@ def run_sync(trigger="schedule"):
            "added_series=?, removed_movies=?, removed_series=?, detail=? WHERE id=?",
            time.time(), tot["movies"], tot["series"], tot["removed_movies"] + tot["removed_series"], 1 if ok else 0,
            err or None, tot["added_movies"], tot["added_series"], tot["removed_movies"], tot["removed_series"],
-           json.dumps(detail), run_id)
+           json.dumps([{k: v for k, v in d.items() if k != "titles"} for d in detail]), run_id)
         log("Catalog sync done: %s%s" % (sync_summary(tot), ("; errors: " + err) if err else ""))
+        try:
+            write_sync_changes(run_id, started, trigger, detail, tot, err)
+        except OSError as e:
+            log("Could not save the sync's change list: %s" % e, "warn")
         return ok
     except Exception as e:
         SYNC["error"] = mask(str(e))
@@ -1474,8 +1504,8 @@ def sync_provider(p, started):
     c = db()
     c.execute("BEGIN")
     try:
-        before_m = c.execute("SELECT COUNT(*) FROM movies WHERE prov=?", (pid,)).fetchone()[0]
-        before_s = c.execute("SELECT COUNT(*) FROM series WHERE prov=?", (pid,)).fetchone()[0]
+        had_m = {r[0] for r in c.execute("SELECT id FROM movies WHERE prov=?", (pid,))}
+        had_s = {r[0] for r in c.execute("SELECT id FROM series WHERE prov=?", (pid,))}
         c.execute("DELETE FROM categories WHERE prov=?", (pid,))
         c.executemany("INSERT OR REPLACE INTO categories(kind, id, name, prov, grp, canon) VALUES(?,?,?,?,?,?)", cats)
         c.executemany("""INSERT INTO movies(id, prov, name, clean, norm, year, tmdb, ext, cat, icon, rating, added, gen,
@@ -1500,13 +1530,18 @@ def sync_provider(p, started):
             rating_n=COALESCE(excluded.rating_n, series.rating_n),
             first_seen=COALESCE(series.first_seen, excluded.first_seen), work=excluded.work, srch=excluded.srch,
             missing=0""", srows)
-        count = "SELECT COUNT(*) FROM %s WHERE prov=?"
-        added_m = c.execute(count % "movies", (pid,)).fetchone()[0] - before_m
-        added_s = c.execute(count % "series", (pid,)).fetchone()[0] - before_s
+        # (title, year) of every title this sync added, removed, or found missing but kept for now
+        added = {"movie": {r[0]: (r[3], r[5]) for r in mrows if r[0] not in had_m},
+                 "series": {r[0]: (r[3], r[5]) for r in srows if r[0] not in had_s}}
         c.execute("UPDATE movies SET missing=missing+1 WHERE prov=? AND gen<>?", (pid, gen))
         c.execute("UPDATE series SET missing=missing+1 WHERE prov=? AND gen<>?", (pid, gen))
-        removed_m = c.execute("DELETE FROM movies WHERE prov=? AND missing>?", (pid, grace)).rowcount
-        removed_s = c.execute("DELETE FROM series WHERE prov=? AND missing>?", (pid, grace)).rowcount
+        removed, kept = {}, {}
+        for kind, table in (("movie", "movies"), ("series", "series")):
+            removed[kind] = [(r[0], r[1]) for r in c.execute(
+                "SELECT clean, year FROM %s WHERE prov=? AND missing>?" % table, (pid, grace))]
+            kept[kind] = c.execute("SELECT COUNT(*) FROM %s WHERE prov=? AND missing BETWEEN 1 AND ?" % table,
+                                   (pid, grace)).fetchone()[0]
+            c.execute("DELETE FROM %s WHERE prov=? AND missing>?" % table, (pid, grace))
         c.execute("DELETE FROM episodes WHERE prov=? AND series_id NOT IN (SELECT id FROM series)", (pid,))
         if FTS:
             lo, hi = pid * SCALE, (pid + 1) * SCALE
@@ -1520,10 +1555,55 @@ def sync_provider(p, started):
     for r in q("SELECT id FROM movies WHERE prov=? AND qual IS NULL AND (width IS NOT NULL OR id IN "
                "(SELECT id FROM probes WHERE error IS NULL))", pid):
         set_qual("movies", r["id"])
-    res = {"provider": name, "movies": len(mrows), "series": len(srows), "added_movies": added_m,
-           "added_series": added_s, "removed_movies": removed_m, "removed_series": removed_s}
+    res = {"provider": name, "movies": len(mrows), "series": len(srows),
+           "added_movies": len(added["movie"]), "added_series": len(added["series"]),
+           "removed_movies": len(removed["movie"]), "removed_series": len(removed["series"]),
+           "kept_movies": kept["movie"], "kept_series": kept["series"],
+           "titles": {"added": {k: list(v.values()) for k, v in added.items()}, "removed": removed}}
     log("%s: %s" % (name, sync_summary(res)))
     return res
+
+
+SYNC_CHANGES_DIR = os.path.join(DATA_DIR, "sync-changes")
+SYNC_CHANGES_KEEP = 30
+
+
+def sync_changes_path(run_id):
+    return os.path.join(SYNC_CHANGES_DIR, "sync-%d.txt" % int(run_id))
+
+
+def write_sync_changes(run_id, started, trigger, detail, tot, err):
+    """A readable list of every title a sync added or removed, one file per sync (the newest 30 are kept)."""
+    out = ["VODgrab catalog sync %s (%s)" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(started)), trigger), ""]
+    for d in detail:
+        out.append("%s: %s" % (d["provider"], sync_summary(d)))
+    out.append("Total: %s" % sync_summary(tot))
+    if err:
+        out.append("Errors: %s" % err)
+    for section, label in (("removed", "Removed"), ("added", "Added")):
+        lines = []
+        for d in detail:
+            for kind in ("movie", "series"):
+                for title, year in d["titles"][section][kind]:
+                    lines.append((d["provider"], kind, (title or "").lower(), "[%s] %-6s  %s%s" % (
+                        d["provider"], kind, title, " (%s)" % year if year else "")))
+        out += ["", "== %s (%d) ==" % (label, len(lines))] + [x[3] for x in sorted(lines)]
+    kept = [(d["provider"], d["kept_movies"], d["kept_series"]) for d in detail if d["kept_movies"] or d["kept_series"]]
+    out += ["", "== No longer listed by the provider, kept for now (%d) ==" % sum(m + s for _, m, s in kept)]
+    out += ["%s: %d movies, %d series" % k for k in kept]
+    if kept:
+        g = int(S()["grace_cycles"])
+        out.append("These are removed if they are still missing after %d more sync%s, and then listed above."
+                   % (g, "" if g == 1 else "s"))
+    os.makedirs(SYNC_CHANGES_DIR, exist_ok=True)
+    tmp = sync_changes_path(run_id) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, sync_changes_path(run_id))
+    files = sorted((f for f in os.listdir(SYNC_CHANGES_DIR) if re.match(r"^sync-\d+\.txt$", f)),
+                   key=lambda f: int(f[5:-4]))
+    for f in files[:-SYNC_CHANGES_KEEP]:
+        os.remove(os.path.join(SYNC_CHANGES_DIR, f))
 
 
 def sync_summary(r):
@@ -3579,7 +3659,8 @@ def status_view():
     s = S()
     in_win, conc = window_state()
     last = q1("SELECT * FROM sync_runs WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1")
-    return {"version": VERSION, "configured": bool(active_providers()), "paused": s["paused"], "banner": ENGINE.banner, "prov_error": bool(ENGINE.prov_errors), "arrs": {"radarr": RADARR.ok(), "sonarr": SONARR.ok()},
+    return {"version": VERSION, "update": UPDATE["latest"] if UPDATE["latest"] and vtuple(UPDATE["latest"]) >
+            vtuple(VERSION) else "", "configured": bool(active_providers()), "paused": s["paused"], "banner": ENGINE.banner, "prov_error": bool(ENGINE.prov_errors), "arrs": {"radarr": RADARR.ok(), "sonarr": SONARR.ok()},
             "ffprobe": bool(FFPROBE), "fts": FTS, "probe_open": bool(FFPROBE and s.get("probe_on_open")),
             "window": {"enabled": s["schedule_enabled"] and bool(s["windows"]), "open": in_win, "concurrency": conc},
             "sync": {"running": SYNC["running"], "phase": SYNC["phase"], "error": SYNC["error"],
@@ -5544,6 +5625,31 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             shutil.copyfileobj(f, self.wfile, MB)
 
+    def send_logs(self):
+        """All log files back to back, oldest first, as one download."""
+        with _log_lock:  # open and size them in one go; open files survive a rotation
+            parts = []
+            for path in log_files():
+                f = open(path, "rb")
+                parts.append((f, os.fstat(f.fileno()).st_size))
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(sum(n for _, n in parts)))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="vodgrab-logs-%s.txt"' % time.strftime("%Y%m%d-%H%M"))
+            self.end_headers()
+            for f, n in parts:
+                while n > 0:
+                    chunk = f.read(min(MB, n))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    n -= len(chunk)
+        finally:
+            for f, _ in parts:
+                f.close()
+
     def play_stream(self, sid):
         """Pass the provider's stream to the browser, with byte ranges so the player can skip around."""
         sess = PLAY.get(sid)
@@ -5755,8 +5861,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"ok": False, "message": "A sync is already running"})
             threading.Thread(target=run_sync, args=("manual",), daemon=True).start()
             return self.send(200, {"ok": True})
+        if a == "syncruns" and len(parts) > 2 and parts[2] == "changes":
+            r = q1("SELECT * FROM sync_runs WHERE id=?", to_int(parts[1]))
+            path = sync_changes_path(r["id"]) if r else ""
+            if not path or not os.path.isfile(path):
+                return self.send(404, {"error": "No change list for that sync (only the last %d are kept)"
+                                                % SYNC_CHANGES_KEEP})
+            return self.send_file(path, "vodgrab-sync-%s.txt" % time.strftime(
+                "%Y%m%d-%H%M", time.localtime(r["started"])), "text/plain; charset=utf-8")
         if a == "syncruns":
-            return self.send(200, [dict(r) for r in q("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 15")])
+            return self.send(200, [dict(r, changes=os.path.isfile(sync_changes_path(r["id"])))
+                                   for r in q("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 15")])
         if a == "unmatched":
             return self.send(200, [dict(r) for r in q("SELECT * FROM unmatched ORDER BY seen DESC")])
         if a == "override" and method == "POST":
@@ -5799,9 +5914,141 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(catalog_report(), indent=1, ensure_ascii=False).encode()
             return self.send(200, body, "application/json", {
                 "Content-Disposition": 'attachment; filename="vodgrab-catalog-report.json"'})
+        if a == "update":
+            if method == "POST" and len(parts) > 1 and parts[1] == "apply":
+                return self.send(200, apply_update())
+            if method == "POST":
+                return self.send(200, check_update())
+            return self.send(200, update_view())
+        if a == "logs" and len(parts) > 1 and parts[1] == "download":
+            return self.send_logs()
         if a == "logs":
             return self.send(200, list(LOG)[-300:])
         self.send(404, {"error": "unknown endpoint"})
+
+
+# ------------------------------------------------------------------ updates
+
+UPDATE_URL = os.environ.get("VODGRAB_UPDATE_URL",
+                            "https://raw.githubusercontent.com/Deekerman/VODgrab/main/vodgrab.py")
+CHANGELOG_URL = os.environ.get("VODGRAB_CHANGELOG_URL",
+                               "https://raw.githubusercontent.com/Deekerman/VODgrab/main/CHANGELOG.md")
+IN_DOCKER = os.environ.get("VODGRAB_DOCKER") == "1" or os.path.exists("/.dockerenv")
+UPDATE = {"latest": "", "notes": "", "checked": 0, "error": "", "applying": False}
+UPDATE_HEADERS = {"User-Agent": "VODgrab/%s" % VERSION, "Cache-Control": "no-cache"}
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def remote_version(text):
+    m = re.search(r'^VERSION = "([0-9][^"]*)"', text, re.M)
+    return m.group(1) if m else ""
+
+
+def release_notes(newer_than):
+    """The CHANGELOG.md sections for versions newer than this one."""
+    try:
+        _, raw = http(CHANGELOG_URL, headers=UPDATE_HEADERS, timeout=20)
+    except Exception:
+        return ""
+    keep, out = False, []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        m = re.match(r"^##\s+v?(\d+\.\d+\.\d+)", line)
+        if m:
+            keep = vtuple(m.group(1)) > vtuple(newer_than)
+        if keep:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def check_update():
+    try:
+        _, raw = http(UPDATE_URL, headers=dict(UPDATE_HEADERS, Range="bytes=0-8191"), timeout=20)
+        latest = remote_version(raw.decode("utf-8", "replace"))
+        if not latest:
+            raise RuntimeError("could not read the version from %s" % UPDATE_URL)
+        newer = vtuple(latest) > vtuple(VERSION)
+        UPDATE.update(latest=latest, notes=release_notes(VERSION) if newer else "", error="")
+        if newer and UPDATE.get("logged") != latest:
+            UPDATE["logged"] = latest
+            log("VODgrab %s is available (you have %s)" % (latest, VERSION))
+    except Exception as e:
+        UPDATE["error"] = str(e)
+    UPDATE["checked"] = time.time()
+    return update_view()
+
+
+def update_view():
+    me = os.path.abspath(__file__)
+    writable = os.access(me, os.W_OK) and os.access(os.path.dirname(me), os.W_OK)
+    return {"current": VERSION, "latest": UPDATE["latest"], "notes": UPDATE["notes"], "error": UPDATE["error"],
+            "checked": UPDATE["checked"], "docker": IN_DOCKER, "applying": UPDATE["applying"],
+            "available": bool(UPDATE["latest"]) and vtuple(UPDATE["latest"]) > vtuple(VERSION),
+            "can_update": not IN_DOCKER and writable, "path": me,
+            "manual": "sudo curl -fsSL -o %s %s && sudo systemctl restart vodgrab" % (me, UPDATE_URL)}
+
+
+def apply_update():
+    """Replace this file with the newest vodgrab.py from GitHub, then restart in place."""
+    v = update_view()
+    if IN_DOCKER:
+        raise ValueError("This copy runs in Docker. Update with: docker compose pull && docker compose up -d")
+    if UPDATE["applying"]:
+        raise ValueError("An update is already being installed")
+    if not v["can_update"]:
+        raise ValueError("VODgrab cannot write to %s. Update by hand: %s" % (os.path.dirname(v["path"]), v["manual"]))
+    try:
+        _, raw = http(UPDATE_URL, headers=UPDATE_HEADERS, timeout=180)
+    except Exception as e:
+        raise ValueError("Download failed: %s" % e)
+    text = raw.decode("utf-8")
+    latest = remote_version(text)
+    if not latest or "def main():" not in text:
+        raise ValueError("The downloaded file does not look like VODgrab; nothing was changed")
+    if vtuple(latest) <= vtuple(VERSION):
+        raise ValueError("You already have the latest version (%s)" % VERSION)
+    try:
+        compile(text, v["path"], "exec")
+    except SyntaxError as e:
+        raise ValueError("The downloaded file is damaged (%s); nothing was changed" % e)
+    me = v["path"]
+    new = me + ".new"
+    with open(new, "w", encoding="utf-8") as f:
+        f.write(text)
+    shutil.copymode(me, new)
+    # Start the new file once on its own; it must load and report its version before it replaces this one
+    try:
+        out = subprocess.run([sys.executable, new, "version"], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, VODGRAB_DATA=os.path.join(DATA_DIR, "update-check")))
+        ok = out.returncode == 0 and out.stdout.strip() == latest
+        why = (out.stderr or out.stdout).strip().splitlines()[-1:] if not ok else []
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok, why = False, [str(e)]
+    shutil.rmtree(os.path.join(DATA_DIR, "update-check"), ignore_errors=True)
+    if not ok:
+        os.remove(new)
+        raise ValueError("The new version did not start (%s); nothing was changed" % (why[0] if why else "no output"))
+    shutil.copy2(me, me + ".bak")
+    os.replace(new, me)
+    UPDATE["applying"] = True
+    log("Updating VODgrab %s to %s and restarting (previous version saved as %s.bak)" % (VERSION, latest, me))
+    threading.Thread(target=restart_self, daemon=True).start()
+    return {"ok": True, "version": latest}
+
+
+def restart_self():
+    time.sleep(1.5)  # let the browser get its answer first
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+def update_worker():
+    time.sleep(60)
+    while True:
+        if S().get("update_check"):
+            check_update()
+        time.sleep(24 * 3600)
 
 
 # ------------------------------------------------------------------ commands
@@ -5823,6 +6070,7 @@ def cmd_serve(args):
     threading.Thread(target=probe_background, daemon=True).start()
     threading.Thread(target=meta_worker, daemon=True).start()
     threading.Thread(target=play_reaper, daemon=True).start()
+    threading.Thread(target=update_worker, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
     srv.daemon_threads = True
     log("VODgrab %s listening on port %s (data in %s)" % (VERSION, port, DATA_DIR))
@@ -5876,7 +6124,11 @@ def main():
     sp.add_argument("--port", type=int)
     sub.add_parser("install")
     sub.add_parser("sync")
+    sub.add_parser("version")
     args = ap.parse_args()
+    if args.cmd == "version":
+        print(VERSION)
+        return
     {"serve": cmd_serve, "install": cmd_install, "sync": cmd_sync}.get(args.cmd or "serve")(args)
 
 
@@ -5895,6 +6147,7 @@ header{position:sticky;top:0;z-index:5;background:rgba(15,17,21,.95);backdrop-fi
 .bar{display:flex;align-items:center;gap:14px;padding:10px 16px;flex-wrap:wrap}
 .brand{font-weight:700;font-size:17px;letter-spacing:.3px}
 .brand span{color:var(--acc)}
+.brand img{display:block;height:36px;width:auto}
 nav{display:flex;gap:4px;flex-wrap:wrap}
 nav button{background:none;border:0;color:var(--dim);padding:7px 11px;border-radius:8px;cursor:pointer;font:inherit}
 nav button.on{background:var(--panel2);color:var(--text)}
@@ -6081,7 +6334,7 @@ body.hasrail main{padding-right:52px}
 <body>
 <header>
   <div class="bar">
-    <div class="brand">VOD<span>grab</span></div>
+    <div class="brand"><img src="data:image/png;base64,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" alt="VODgrab" width="147" height="36"></div>
     <nav id="nav">
       <button data-t="browse" class="on">Browse</button>
       <button data-t="queue">Queue<span class="n" id="nQ" hidden></span></button>
@@ -6093,6 +6346,7 @@ body.hasrail main{padding-right:52px}
     <div class="pills">
       <span class="pill" id="pSync">Sync</span>
       <span class="pill" id="pWin"></span>
+      <span class="pill ok" id="pUpd" hidden style="cursor:pointer" title="Open Settings to update"></span>
       <button class="btn s" id="pauseBtn">Pause all</button>
     </div>
   </div>
@@ -6137,6 +6391,7 @@ window.addEventListener("popstate",()=>route());
 function route(){const r=readHash();if(r.tab=="browse"){F=r.f}show(r.tab)}
 
 $$("#nav button").forEach(b=>b.onclick=()=>go(b.dataset.t));
+$("#pUpd").onclick=()=>go("settings");
 function go(t){if(t=="browse"&&F){writeHash(false)}else if(location.hash.split("?")[0]!=="#"+t){skipHash=true;history.pushState(null,"","#"+t+(t=="wanted"&&typeof WF!="undefined"?(()=>{const p=new URLSearchParams();for(const k in WDEF)if(WF[k]!==WDEF[k]&&WF[k]!=="")p.set(k,WF[k]);return p.toString()?"?"+p:""})():""))}show(t)}
 function show(t){tab=t;$$("#nav button").forEach(b=>b.classList.toggle("on",b.dataset.t==t));clearInterval(timer);hideRail();
   ({browse:renderBrowse,queue:renderQueue,wanted:renderWanted,history:renderHistory,unmatched:renderUnmatched,settings:renderSettings})[t]()}
@@ -6153,6 +6408,7 @@ async function refreshStatus(){try{status=await api("status")}catch(e){return}
   else if(!w.enabled){pw.textContent="Downloads any time";pw.className="pill ok"}
   else if(w.open){pw.textContent=`Window open · ${w.concurrency} stream${w.concurrency>1?"s":""}`;pw.className="pill ok"}
   else{pw.textContent="Outside download window";pw.className="pill warn"}
+  const pu=$("#pUpd");pu.hidden=!status.update;pu.textContent=status.update?`Update available: ${status.update}`:"";
   $("#pauseBtn").textContent=status.paused||status.prov_error?"Resume":"Pause all";
   const b=$("#banner");b.style.display=status.banner?"block":"none";b.textContent=status.banner||"";
   const nq=$("#nQ");nq.hidden=!status.counts.active;nq.textContent=status.counts.active;
@@ -6703,7 +6959,7 @@ async function renderSettings(){
   <section class="set"><h3>Catalog sync</h3><div class="fields">
     ${fld("sync_interval_hours","Sync interval","select","Runs start at midnight",SV.intervals.map(h=>[h,ivLabel(h)]))}
     ${fld("grace_cycles","Keep missing titles for this many syncs","number")}</div>
-    <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button></div><div id="runs"></div></section>
+    <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button><a class="btn" id="lastChg" download hidden>Download last sync changes</a></div><div id="runs"></div></section>
   <section class="set"><h3>Quality checks</h3>
     <div class="hint muted" style="margin-bottom:10px">When Sonarr or Radarr search, VODgrab reads the header of every copy it is about to offer so the quality it reports is the real one. Copies with different quality become separate releases, and missing files are left out. Each check uses one provider connection for a few seconds and is remembered.</div>
     <div class="fields">
@@ -6761,7 +7017,11 @@ async function renderSettings(){
     <div class="tools" style="margin-top:12px"><button class="btn s" id="newKey">New API key</button></div></section>
   <section class="set"><h3>Catalog report</h3><div class="hint muted" style="margin-bottom:10px">A file listing every category, sample titles, name prefixes and the fields each provider sends. Useful for tuning search and filters. It contains no usernames, passwords or server addresses. It pulls the full catalog live, so it can take a minute.</div>
     <button class="btn s" id="repBtn">Download catalog report</button></section>
-  <section class="set"><h3>Log</h3><button class="btn s" id="logBtn">Show log</button><div class="out" id="o_log"></div></section>
+  <section class="set"><h3>Updates</h3><div id="updBox" class="sub">Checking for updates…</div>
+    ${fld("update_check","Check for new versions once a day","bool")}
+    <div class="tools" style="margin-top:10px"><button class="btn s" id="updCheck">Check now</button>
+    <button class="btn s p" id="updApply" hidden>Update now</button></div></section>
+  <section class="set"><h3>Log</h3><button class="btn s" id="logBtn">Show log</button> <a class="btn s" href="/api/logs/download" download>Download all logs</a><div class="out" id="o_log"></div></section>
   <div class="savebar"><button class="btn p" id="save">Save settings</button></div>`;
   drawProvs(SV.providers);$("#addProv").onclick=()=>{if($(".prov[data-pid='']"))return;drawProvs([...SV.providers,{}])};
   let wins=JSON.parse(JSON.stringify(s.windows||[]));
@@ -6788,9 +7048,31 @@ async function renderSettings(){
     try{const r=await fetch("/api/report");if(!r.ok)throw new Error((await r.json()).error||r.statusText);const blob=await r.blob();
       const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="vodgrab-catalog-report.json";document.body.appendChild(a);a.click();a.remove();toast("Report downloaded")}
     catch(x){toast(x.message,1)}b.disabled=false;b.textContent="Download catalog report"};
+  let updLatest="";
+  const updShow=u=>{const box=$("#updBox");if(!box)return;updLatest=u.latest;
+    let h=`You have VODgrab <b>${esc(u.current)}</b>`;
+    if(u.error&&!u.latest)h+=` · could not check for updates: ${esc(u.error)}`;
+    else if(u.available)h+=` · <b style="color:var(--acc)">${esc(u.latest)} is available</b>`;
+    else if(u.latest)h+=" · this is the latest version";
+    if(u.checked)h+=` <span style="opacity:.7">(checked ${ago(u.checked)})</span>`;
+    if(u.available&&u.notes)h+=`<pre class="out" style="display:block;white-space:pre-wrap;max-height:260px;overflow:auto;margin-top:8px">${esc(u.notes)}</pre>`;
+    if(u.available&&u.docker)h+=`<div style="margin-top:8px">VODgrab runs in Docker. To update, run this where your docker-compose.yml is:<pre class="out" style="display:block;margin-top:6px">docker compose pull && docker compose up -d</pre></div>`;
+    else if(u.available&&!u.can_update)h+=`<div style="margin-top:8px">VODgrab cannot replace its own file at ${esc(u.path)}. Update by hand:<pre class="out" style="display:block;white-space:pre-wrap;margin-top:6px">${esc(u.manual)}</pre></div>`;
+    box.innerHTML=h;$("#updApply").hidden=!(u.available&&u.can_update)};
+  api("update").then(u=>{if(!u.checked)return api("update",{});return u}).then(updShow).catch(()=>{});
+  $("#updCheck").onclick=async()=>{$("#updCheck").disabled=true;try{updShow(await api("update",{}))}catch(e){toast(e.message,1)}$("#updCheck").disabled=false};
+  $("#updApply").onclick=async()=>{const n=status&&status.counts?status.counts.active:0;
+    if(!confirm(`Update VODgrab to ${updLatest} and restart?`+(n?`\n\n${n} active download${n>1?"s":""} will pause for a moment and then continue where they left off.`:"")))return;
+    $("#updApply").disabled=true;
+    try{const r=await api("update/apply",{});toast(`Installing ${r.version}, restarting…`);
+      const t0=Date.now();await new Promise(ok=>setTimeout(ok,3000));
+      for(;;){try{const s=await api("status");if(s.version==r.version){location.reload();return}}catch(e){}
+        if(Date.now()-t0>90000){toast("VODgrab has not come back yet. Check the service log.",1);break}
+        await new Promise(ok=>setTimeout(ok,2000))}}
+    catch(e){toast(e.message,1)}$("#updApply").disabled=false};
   $("#logBtn").onclick=async()=>{const l=await api("logs");out("log",l.slice().reverse().join("\n")||"Empty")};
 function runSum(x){return x.added_movies==null?`${x.movies} movies, ${x.series} series, ${x.removed} removed`:`${x.movies} movies (+${x.added_movies} new, ${x.removed_movies} removed), ${x.series} series (+${x.added_series} new, ${x.removed_series} removed)`}
-  const runs=async()=>{const r=await api("syncruns");$("#runs").innerHTML=r.length?`<div class="list" style="margin-top:10px">${r.slice(0,6).map(x=>`<div class="sub">${new Date(x.started*1000).toLocaleString()} · ${esc(x.trigger)} · ${x.finished==null?"running":x.ok?runSum(x):"failed: "+esc(x.error)}</div>${x.ok&&x.detail?JSON.parse(x.detail).map(d=>`<div class="sub" style="padding-left:14px">${esc(d.provider)}: ${runSum(d)}</div>`).join(""):""}`).join("")}</div>`:""};runs();
+  const runs=async()=>{const r=await api("syncruns");const lc=r.find(x=>x.changes);$("#lastChg").hidden=!lc;if(lc)$("#lastChg").href=`/api/syncruns/${lc.id}/changes`;$("#runs").innerHTML=r.length?`<div class="list" style="margin-top:10px">${r.slice(0,6).map(x=>`<div class="sub">${new Date(x.started*1000).toLocaleString()} · ${esc(x.trigger)} · ${x.finished==null?"running":x.ok?runSum(x):"failed: "+esc(x.error)}${x.changes?` · <a href="/api/syncruns/${x.id}/changes" download>Changes</a>`:""}</div>${x.ok&&x.detail?JSON.parse(x.detail).map(d=>`<div class="sub" style="padding-left:14px">${esc(d.provider)}: ${runSum(d)}</div>`).join(""):""}`).join("")}</div>`:""};runs();
   async function save(quiet){readWins();const body={};
     for(const el of $$("#main [id^=s_]")){const k=el.id.slice(2);if(el.type=="checkbox")body[k]=el.checked;else if(el.tagName=="TEXTAREA")body[k]=el.value.split("\n").map(x=>x.trim()).filter(Boolean);else body[k]=el.value}
     body.retry_backoff=String(body.retry_backoff).split(",").map(x=>x.trim()).filter(Boolean);body.windows=wins;

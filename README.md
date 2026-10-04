@@ -1,6 +1,6 @@
 <div align="center">
 
-# VODgrab
+<img src="docs/logo.png" alt="VODgrab" width="520">
 
 **Turn your Xtream IPTV VOD library into real video files for Sonarr and Radarr.**
 
@@ -30,6 +30,8 @@ It is VERY important to note, this was made entirely by AI.
 - **Metadata.** Optional TMDB, OMDb and TVDB keys add artwork, cast, age ratings and better matching.
 - **Unmatched review.** Fix titles VODgrab couldn't match yourself, and the fix is remembered.
 - **Backups.** Scheduled backups of settings, metadata and the catalog, with restore from the UI.
+- **Sync change lists.** See exactly which titles each catalog sync added or removed, and download the list.
+- **In-app updates.** Get notified of new versions, with release notes and one-click updating for Python-file installs.
 - **Web login** and a SABnzbd-style API key.
 
 ## Screenshots
@@ -162,7 +164,7 @@ python3 vodgrab.py sync                # run one catalog sync and exit
 
 Data (database, settings, backups) is stored in a `data` folder next to the script, `/opt/vodgrab/data` in the example above. Set `VODGRAB_DATA` to store it somewhere else.
 
-**Updating:** download the file again over the old one, then restart:
+**Updating:** open **Settings → Updates** and press **Update now**. VODgrab downloads the new version, keeps the old one as `vodgrab.py.bak`, and restarts itself. Downloads in progress pick up where they left off. To update by hand instead, download the file again over the old one, then restart:
 
 ```sh
 sudo curl -fsSL -o /opt/vodgrab/vodgrab.py \
@@ -170,7 +172,7 @@ sudo curl -fsSL -o /opt/vodgrab/vodgrab.py \
 sudo systemctl restart vodgrab
 ```
 
-**Logs:** `journalctl -u vodgrab -f`
+**Logs:** `journalctl -u vodgrab -f`, or **Settings → Log → Download all logs**. Log files are kept in `data/logs/`.
 
 > [!NOTE]
 > The service runs as root. Set **Owner for new files** (for example `1000:1000`) in VODgrab's settings so Sonarr and Radarr can move the downloaded files.
@@ -181,7 +183,7 @@ sudo systemctl restart vodgrab
 docker compose pull && docker compose up -d
 ```
 
-Your settings and catalog live in `/data`, so updating keeps them.
+Your settings and catalog live in `/data`, so updating keeps them. **Settings → Updates** tells you when a new version is out and what changed (see [CHANGELOG.md](CHANGELOG.md)).
 
 ## Disclaimer
 

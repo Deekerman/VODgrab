@@ -7,6 +7,7 @@ RUN apt-get update \
 
 ENV PYTHONUNBUFFERED=1 \
     VODGRAB_DATA=/data \
+    VODGRAB_DOCKER=1 \
     PUID=1000 \
     PGID=1000
 
