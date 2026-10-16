@@ -2,6 +2,12 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.14.0 (2026-10-16)
+
+- **Unreachable providers no longer cause endless retries.** After two connection failures in a row (name not found, refused, timed out), a provider is marked down. VODgrab stops using it for downloads, quality checks and lookups, stops offering its copies to Radarr and Sonarr (so they don't grab them over and over), and checks it again after 15 min, 30 min, 1 h, 2 h, 4 h, then every 6 h. One log line when it goes down, one when it is back. The banner and the provider card show it.
+- **Downloads wait for an unreachable provider** instead of failing and being grabbed again. Radarr and Sonarr see them as queued. If the provider stays down, each fails once after **Settings → Downloads → When a provider is unreachable, give up after** (default 24 hours).
+- **History:** new **Remove failed**, **Remove completed** and **Remove all** buttons. Files are never touched, and downloads Radarr or Sonarr haven't imported yet are kept.
+
 ## 1.13.1 (2026-10-04)
 
 - **Gentler on providers:** the catalog sync runs at most every 6 hours (the 1 to 4 hour choices are gone; daily stays the default). Installs set below 6 hours move to 6.

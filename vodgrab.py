@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.13.1"
+VERSION = "1.14.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -97,6 +97,7 @@ DEFAULTS = {
     "sync_interval_hours": 24,
     "grace_cycles": 1,
     "missing_recheck_hours": 2,
+    "down_giveup_hours": 24,
     "min_score": 90,
     "cleanup_patterns": [],
     "auto_import_manual": True,
@@ -472,6 +473,8 @@ def save_provider(data):
                  *vals.values()).lastrowid
     load_providers()
     ENGINE.prov_errors.pop(pid, None)
+    ENGINE.down.pop(pid, None)  # edited (maybe a new address): try it again right away
+    ENGINE.fails.pop(pid, None)
     threading.Thread(target=catalog_changed, args=(True,), daemon=True).start()
     return pid
 
@@ -498,7 +501,8 @@ def providers_view():
         d["source"] = p.get("source") or ""
         d["password_set"] = bool(p.get("password"))
         d["active"] = ENGINE.active_count(p["id"])
-        d["error"] = ENGINE.prov_errors.get(p["id"], "")
+        d["error"] = ENGINE.prov_errors.get(p["id"], "") or ENGINE.down_text(p["id"])
+        d["down"] = ENGINE.is_down(p["id"])
         d["movies"] = q1("SELECT COUNT(*) c FROM movies WHERE prov=?", p["id"])["c"]
         d["series"] = q1("SELECT COUNT(*) c FROM series WHERE prov=?", p["id"])["c"]
         out.append(d)
@@ -578,6 +582,8 @@ def save_settings(upd):
                 v = max(1, min(50, v or 25))
             if k == "probe_series_open" and v not in ("season", "first", "off"):
                 raise ValueError("TV quality check must be season, first or off")
+            if k == "down_giveup_hours" and v not in (6, 12, 24, 48, 72):
+                raise ValueError("Give-up time must be 6, 12, 24, 48 or 72 hours")
             if k == "missing_recheck_hours" and v not in RECHECK_HOURS:
                 raise ValueError("Recheck must be one of %s hours (0 is off)" % RECHECK_HOURS)
             if k == "grace_cycles":
@@ -1077,10 +1083,12 @@ def http(url, method="GET", body=None, headers=None, timeout=60, final=None):
     raise RuntimeError("Too many redirects")
 
 
-def xt_api(pid, action=None, timeout=120, **params):
+def xt_api(pid, action=None, timeout=120, force=False, **params):
     p = prov(pid)
     if not p["url"]:
         raise RuntimeError("%s has no server URL" % p["name"])
+    if not force:
+        ENGINE.check_up(pid)
     args = {"username": p["username"], "password": p["password"]}
     if action:
         args["action"] = action
@@ -1089,9 +1097,12 @@ def xt_api(pid, action=None, timeout=120, **params):
     try:
         _, raw = http(url, headers={"User-Agent": p["user_agent"] or DEFAULT_UA}, timeout=timeout)
     except urllib.error.HTTPError as e:
+        ENGINE.note_ok(pid)  # it answered, so it is up
         raise RuntimeError("%s returned HTTP %s for %s" % (p["name"], e.code, action or "account info"))
     except (urllib.error.URLError, OSError) as e:
+        ENGINE.note_fail(pid, getattr(e, "reason", e))
         raise RuntimeError("%s unreachable: %s" % (p["name"], getattr(e, "reason", e)))
+    ENGINE.note_ok(pid)
     try:
         return json.loads(raw.decode("utf-8", "replace") or "null")
     except ValueError:
@@ -1283,6 +1294,11 @@ def best_by_title(results, title, year):
 
 
 # ------------------------------------------------------------------ matching
+
+
+def not_down():
+    """SQL to leave out providers that are down (for what Radarr and Sonarr are offered)."""
+    return " AND prov NOT IN (%s)" % ",".join(str(p) for p in ENGINE.down) if ENGINE.down else ""
 
 
 def live(adult=None):
@@ -1516,6 +1532,8 @@ def run_sync(trigger="schedule", only=None):
         errors = []
         for p in provs:
             try:
+                if ENGINE.is_down(p["id"]):  # a sync is a good moment to check it again
+                    ENGINE.health_check(p["id"])
                 res = sync_provider(p, started)
                 detail.append(res)
                 for k in keys:
@@ -1848,7 +1866,8 @@ def episode_equivalents(eid, fetch=True):
             try:
                 ensure_episodes(sid)
             except Exception as ex_:
-                log("Episode list for %s failed: %s" % (pname(dec(sid)[0]), ex_), "warn")
+                if not isinstance(ex_, ProviderDown):
+                    log("Episode list for %s failed: %s" % (pname(dec(sid)[0]), ex_), "warn")
                 continue
         o = q1("SELECT id, ext FROM episodes WHERE series_id=? AND season=? AND episode=?", sid, e["season"],
                e["episode"])
@@ -2004,7 +2023,8 @@ def refresh_wanted():
                     try:
                         ensure_episodes(cp["id"])
                     except Exception as e:
-                        log("Episode list for %s failed: %s" % (lib["title"], e), "warn")
+                        if not isinstance(e, ProviderDown):
+                            log("Episode list for %s failed: %s" % (lib["title"], e), "warn")
                     have.update((r["season"], r["episode"]) for r in
                                 q("SELECT season, episode FROM episodes WHERE series_id=?", cp["id"]))
                 for e in eps:
@@ -2121,7 +2141,8 @@ def movie_row(xid, fetch=True):
         try:
             vod_info(xid)
         except Exception as e:
-            log("Movie info for %s failed: %s" % (pname(dec(xid)[0]), e), "warn")
+            if not isinstance(e, ProviderDown):
+                log("Movie info for %s failed: %s" % (pname(dec(xid)[0]), e), "warn")
     return q1("SELECT * FROM movies WHERE id=?", xid)
 
 
@@ -2203,6 +2224,7 @@ def probe(kind, cid):
         raise ValueError("Install ffmpeg on the VODgrab host to check quality")
     pid = dec(cid)[0]
     p = prov(pid)
+    ENGINE.check_up(pid)
     if not acquire_slot(pid, time.time() + 5):
         raise ValueError("%s is using all its connections right now. Try again when a download finishes."
                          % p["name"])
@@ -2279,13 +2301,16 @@ def ensure_probed(items, budget=None, force=False):
                     return
                 kind, cid = todo.popleft()
             pid = dec(cid)[0]
+            if ENGINE.is_down(pid):
+                continue
             if time.time() >= deadline or not acquire_slot(pid, deadline):
                 PROBE_BG[(kind, cid)] = time.time()
                 continue
             try:
                 _probe_run(kind, cid)
             except Exception as e:
-                log("Quality check failed for %s on %s: %s" % (cid % SCALE, pname(pid), e), "warn")
+                if not isinstance(e, ProviderDown):
+                    log("Quality check failed for %s on %s: %s" % (cid % SCALE, pname(pid), e), "warn")
             finally:
                 release_slot(pid)
 
@@ -2335,6 +2360,8 @@ def probe_background():
                     PROBE_BG.pop(key, None)
                     continue
                 pid = dec(cid)[0]
+                if ENGINE.is_down(pid):
+                    continue
                 if pid not in PROVIDERS:
                     PROBE_BG.pop(key, None)
                     continue
@@ -2771,6 +2798,14 @@ class Transient(Exception):
     pass
 
 
+class Unreachable(Transient):
+    """The provider could not be reached at all (name not found, refused, timed out)."""
+
+
+class ProviderDown(RuntimeError):
+    """The provider is marked down; skipped without contacting it."""
+
+
 class Limited(Exception):
     pass
 
@@ -2844,10 +2879,70 @@ class Engine:
         self.gap_until = 0
         self.prov_errors = {}
         self.cool = {}
+        self.down = {}  # pid -> {"since", "until", "step", "err", "checking"}
+        self.fails = collections.Counter()
 
     @property
     def banner(self):
-        return " ".join(list(self.prov_errors.values()) + list(FOLDER_ERRORS.values()))
+        return " ".join(list(self.prov_errors.values()) + [self.down_text(pid) for pid in list(self.down)] +
+                        list(FOLDER_ERRORS.values()))
+
+    # Provider health: two connection failures in a row mark a provider down. While down it is skipped for
+    # downloads, quality checks, lookups and searches, and checked again after 15 min, 30 min, 1 h, 2 h, 4 h,
+    # then every 6 h, with one cheap account request.
+    DOWN_STEPS = [15, 30, 60, 120, 240, 360]
+
+    def down_text(self, pid):
+        d = self.down.get(pid)
+        if not d:
+            return ""
+        return "%s is unreachable since %s (%s); next check %s." % (
+            pname(pid), time.strftime("%b %d %H:%M", time.localtime(d["since"])), d["err"],
+            time.strftime("%H:%M", time.localtime(d["until"])))
+
+    def is_down(self, pid):
+        return pid in self.down
+
+    def check_up(self, pid):
+        if pid in self.down:
+            raise ProviderDown("%s is unreachable (since %s)" % (
+                pname(pid), time.strftime("%b %d %H:%M", time.localtime(self.down[pid]["since"]))))
+
+    def note_fail(self, pid, err):
+        self.fails[pid] += 1
+        if pid not in self.down and self.fails[pid] >= 2:
+            t = time.time()
+            self.down[pid] = {"since": t, "until": t + self.DOWN_STEPS[0] * 60, "step": 0,
+                              "err": mask(str(err))[:120], "checking": False}
+            log("%s is unreachable (%s). Skipping it until it answers again; next check in %d minutes" % (
+                pname(pid), mask(str(err)), self.DOWN_STEPS[0]), "warn")
+
+    def note_ok(self, pid):
+        self.fails.pop(pid, None)
+        d = self.down.pop(pid, None)
+        if d:
+            mins = int((time.time() - d["since"]) / 60)
+            log("%s is reachable again (was down %s)" % (
+                pname(pid), "%d h %d min" % divmod(mins, 60) if mins >= 60 else "%d min" % mins))
+
+    def health_check(self, pid):
+        d = self.down.get(pid)
+        try:
+            xt_api(pid, timeout=20, force=True)
+        except Exception:
+            d = self.down.get(pid)
+            if d:
+                d["step"] = min(d["step"] + 1, len(self.DOWN_STEPS) - 1)
+                d["until"] = time.time() + self.DOWN_STEPS[d["step"]] * 60
+        finally:
+            if d:
+                d["checking"] = False
+
+    def waiting_on_down(self, j):
+        """For a job whose remaining sources are all on providers that are down: the providers, else []."""
+        bad = set(jmeta(j).get("bad") or [])
+        pids = {dec(cid)[0] for cid, _ in job_sources(j) if cid not in bad and dec(cid)[0] in PROVIDERS}
+        return sorted(pids) if pids and all(p in self.down for p in pids) else []
 
     def active_count(self, pid):
         return sum(1 for w in list(self.workers.values()) if w[2] == pid) + self.probing[pid]
@@ -2868,7 +2963,7 @@ class Engine:
 
     def usable(self, pid, t=None):
         p = PROVIDERS.get(pid)
-        return bool(p and p["enabled"] and p["url"] and pid not in self.prov_errors)
+        return bool(p and p["enabled"] and p["url"] and pid not in self.prov_errors and pid not in self.down)
 
     def viable(self, j):
         """True while some source is untried on a provider that still exists (disabled ones just wait)."""
@@ -2891,6 +2986,10 @@ class Engine:
         t = time.time()
         in_win, conc = window_state(t)
         paused = bool(s["paused"])
+        for pid, d in list(self.down.items()):
+            if t >= d["until"] and not d["checking"]:
+                d["checking"] = True
+                threading.Thread(target=self.health_check, args=(pid,), daemon=True).start()
         with self.lock:
             for jid, (th, flag, pid) in list(self.workers.items()):
                 j = job(jid)
@@ -2915,6 +3014,7 @@ class Engine:
                     continue
                 got = self.pick(r, per, t)
                 if not got:
+                    self.wait_on_down(r, t)
                     continue
                 cid, ext, pid = got
                 flag = Flag()
@@ -2924,6 +3024,25 @@ class Engine:
                 upd(r["id"], status="downloading", started=time.time(), prov=pid)
                 th.start()
                 running += 1
+
+    def wait_on_down(self, j, t):
+        """Downloads whose every source is on a provider that is down wait (Radarr/Sonarr still see them
+        queued, so they don't grab them again), and fail once after the give-up time."""
+        pids = self.waiting_on_down(j)
+        if not pids:
+            return
+        meta = jmeta(j)
+        since = meta.get("down_since") or min(self.down[p]["since"] for p in pids)
+        hours = int(S().get("down_giveup_hours") or 24)
+        names = ", ".join(pname(p) for p in pids)
+        if t - since > hours * 3600:
+            self.fail(j["id"], "%s unreachable for over %d hours" % (names, hours))
+            return
+        msg = "Waiting for %s (unreachable since %s); gives up after %d h" % (
+            names, time.strftime("%b %d %H:%M", time.localtime(since)), hours)
+        if meta.get("down_since") != since or j["error"] != msg:
+            meta["down_since"] = since
+            upd(j["id"], meta=json.dumps(meta), error=msg)
 
     def stop_job(self, jid, reason):
         with self.lock:
@@ -3013,6 +3132,11 @@ class Engine:
                 error="%s at its connection limit (%s)" % (name, e))
             return
         except Transient as e:
+            if isinstance(e, Unreachable):
+                self.note_fail(pid, e)
+                if self.is_down(pid):  # wait for it (or another provider) instead of failing over and over
+                    upd(jid, status="queued", next_at=0, error="%s: %s" % (name, e))
+                    return
             after = os.path.getsize(part) if os.path.exists(part) else 0
             j = job(jid)
             att = j["attempts"]
@@ -3094,7 +3218,8 @@ class Engine:
                 raise Limited("HTTP %d" % code)
             raise Transient("HTTP %d" % code)
         except (urllib.error.URLError, OSError) as e:
-            raise Transient("connection error: %s" % getattr(e, "reason", e))
+            raise Unreachable("connection error: %s" % getattr(e, "reason", e))
+        self.note_ok(pid)
         with resp:
             status = resp.status
             ctype = resp.headers.get("Content-Type", "")
@@ -3234,6 +3359,30 @@ def arr_retry(j):
     return removed
 
 
+def history_clear(what):
+    """Remove failed, completed or all entries from History. Files are left alone. Downloads Radarr or Sonarr
+    have not imported yet are kept (they find them through this history), as is anything that finished in the
+    last 10 minutes, so the arrs see the result first."""
+    failed, done = ("failed", "import_failed", "cancelled"), ("imported", "completed")
+    statuses = {"failed": failed, "completed": done, "all": failed + done}.get(what)
+    if not statuses:
+        raise ValueError("Choose failed, completed or all")
+    removed = kept = 0
+    now = time.time()
+    for j in q("SELECT id, source, status, finished, updated FROM jobs WHERE status IN (%s)"
+               % ",".join("?" * len(statuses)), *statuses):
+        waiting = j["source"] == "arr" and j["status"] == "completed" and now - (j["finished"] or 0) < 14 * 86400
+        recent = j["source"] == "arr" and now - (j["updated"] or 0) < 600
+        if waiting or recent:
+            kept += 1
+            continue
+        ex("DELETE FROM jobs WHERE id=?", j["id"])
+        removed += 1
+    log("History: removed %d %s entr%s%s" % (removed, "" if what == "all" else what, "y" if removed == 1 else "ies",
+                                            " (kept %d still waiting for Radarr/Sonarr)" % kept if kept else ""))
+    return {"removed": removed, "kept": kept}
+
+
 def job_action(jid, action):
     j = job(jid)
     if not j:
@@ -3367,6 +3516,8 @@ def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True):
     """One release per episode and real quality, with every provider's copy of that quality as a source."""
     groups = collections.OrderedDict()
     for sid in sorted(sids, key=prio):
+        if ENGINE.is_down(dec(sid)[0]):  # Sonarr can't grab what a down provider can't send
+            continue
         srow = q1("SELECT * FROM series WHERE id=?", sid)
         if not srow:
             continue
@@ -3385,11 +3536,12 @@ def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True):
 
 def grouped_movies(ids, title_fn, check=True):
     """One release per distinct movie and real quality, with every provider's copy of that quality as a source."""
+    ids = [i for i in ids if not ENGINE.is_down(dec(i)[0])]  # Radarr can't grab what a down provider can't send
     groups, seen = [], set()
     for mid in sorted(ids, key=prio):
         if mid in seen:
             continue
-        same = [i for i in equivalents("movie", mid) if i not in seen]
+        same = [i for i in equivalents("movie", mid) if i not in seen and not ENGINE.is_down(dec(i)[0])]
         seen.update(same)
         groups.append(same)
     if check:
@@ -3418,7 +3570,7 @@ def tv_search(qs):
             ids = sorted(set(ids) | set(equivalents("series", ids[0])), key=prio)
         return grouped_episodes(ids, season, ep, lambda srow: srow["clean"])
     items = []
-    for srow in q("SELECT * FROM series WHERE %s ORDER BY modified DESC LIMIT 10" % live()):
+    for srow in q("SELECT * FROM series WHERE %s%s ORDER BY modified DESC LIMIT 10" % (live(), not_down())):
         eps = episodes_for(srow["id"], None, None)
         items += [ep_item(srow, e, srow["clean"]) for e in list(eps)[-3:]]
     return items
@@ -3441,7 +3593,7 @@ def movie_search(qs):
         ids, _, _ = find_catalog("movie", [term], y, None)
         return grouped_movies(ids, lambda m: (m["clean"], m["year"], None, None))
     return [movie_item(m, m["clean"], m["year"])
-            for m in q("SELECT * FROM movies WHERE %s ORDER BY added DESC LIMIT 100" % live())]
+            for m in q("SELECT * FROM movies WHERE %s%s ORDER BY added DESC LIMIT 100" % (live(), not_down()))]
 
 
 def newznab_search(t, qs):
@@ -6050,6 +6202,8 @@ class Handler(BaseHTTPRequestHandler):
                      "ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'verifying' THEN 0 WHEN 'importing' THEN 1 "
                      "ELSE 2 END, force DESC, pos")
             return self.send(200, [job_row(j) for j in rows])
+        if a == "history" and method == "POST" and len(parts) > 1 and parts[1] == "clear":
+            return self.send(200, history_clear(data.get("what")))
         if a == "history":
             rows = q("SELECT * FROM jobs WHERE status NOT IN ('queued','retry_wait','downloading','verifying',"
                      "'importing') ORDER BY updated DESC LIMIT ?", int(qs.get("limit") or 300))
@@ -7465,12 +7619,18 @@ async function wGo(movies,episodes,btn){if(btn)btn.disabled=true;
 /* ---------------- history */
 async function renderHistory(){
   const rows=await api("history");const m=$("#main");
-  m.innerHTML=rows.length?`<div class="list">${rows.map(j=>`<div class="row"><div class="main"><div class="title">${esc(j.label)}</div>
+  const nf=rows.filter(j=>["failed","import_failed","cancelled"].includes(j.status)).length,nc=rows.filter(j=>["imported","completed"].includes(j.status)).length;
+  const bar=rows.length?`<div class="tools" style="margin-bottom:12px">
+    <button class="btn s" data-clr="failed" ${nf?"":"disabled"}>Remove failed</button><button class="btn s" data-clr="completed" ${nc?"":"disabled"}>Remove completed</button><button class="btn s d" data-clr="all">Remove all</button></div>`:"";
+  m.innerHTML=bar+(rows.length?`<div class="list">${rows.map(j=>`<div class="row"><div class="main"><div class="title">${esc(j.label)}</div>
     <div class="sub"><span class="tag">${j.source=="arr"?esc(j.arr):"Manual"}</span>${j.provider?`<span class="tag">${esc(j.provider)}</span>`:""}${st(j.status)} ${j.total?fb(j.total)+" · ":""}${j.probe?esc(j.probe)+" · ":""}${ago(j.updated)}</div>
     ${j.error?`<div class="sub" style="color:${["failed","import_failed"].includes(j.status)?"var(--bad)":"var(--dim)"}">${esc(j.error)}</div>`:""}
     <div class="sub">${esc(j.release)}</div></div>
     <div class="acts">${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
-    <button class="btn s d" data-a="delete" data-id="${j.id}">${j.status=="import_failed"?"Delete file":"Remove"}</button></div></div>`).join("")}</div>`:`<div class="empty">No history yet.</div>`;
+    <button class="btn s d" data-a="delete" data-id="${j.id}">${j.status=="import_failed"?"Delete file":"Remove"}</button></div></div>`).join("")}</div>`:`<div class="empty">No history yet.</div>`);
+  $$("[data-clr]",m).forEach(b=>b.onclick=async()=>{const w=b.dataset.clr;
+    if(!confirm(`Remove ${w=="all"?"all":w} entries from History?\n\nDownloaded files are not touched. Downloads Radarr or Sonarr haven't imported yet are kept.`))return;
+    try{const r=await api("history/clear",{what:w});toast(`Removed ${r.removed}`+(r.kept?`, kept ${r.kept} still waiting for Radarr/Sonarr`:""));renderHistory()}catch(e){toast(e.message,1)}});
   $$("[data-a]",m).forEach(b=>b.onclick=async()=>{if(b.dataset.a=="delete"&&b.textContent.includes("file")&&!confirm("Delete the downloaded file?"))return;
     try{const r=await api(`job/${b.dataset.id}/${b.dataset.a}`,{});if(r.message)toast(r.message);renderHistory();refreshStatus()}catch(e){toast(e.message,1)}})}
 
@@ -7564,6 +7724,7 @@ async function renderSettings(){
   <section class="set"><h3>Downloads</h3><div class="fields">
     ${fld("concurrency","Total streams across all providers","number","0 means no total limit; each provider still has its own max")}
     ${fld("retries","Retry count","number","Attempts after the first failure")}
+    ${fld("down_giveup_hours","When a provider is unreachable, give up after","select","Downloads whose only source is an unreachable provider wait for it instead of failing over and over, then fail once after this long",[[6,"6 hours"],[12,"12 hours"],[24,"24 hours"],[48,"2 days"],[72,"3 days"]])}
     ${fld("retry_backoff","Wait between retries (minutes)","text","Comma list, the last value repeats")}
     ${fld("max_wait_hours","Max hours to wait at connection limit","number")}
     ${fld("speed_limit_kbps","Speed limit (KB/s, 0 is unlimited)","number")}
