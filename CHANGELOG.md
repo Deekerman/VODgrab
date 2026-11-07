@@ -2,6 +2,16 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.0 (2026-11-07)
+
+- **Manual downloads import into the right episode.** VODgrab used to hand Sonarr the file and let it work out the episode from the file name. For shows with scene numbering on TheXEM, or several shows with the same title, Sonarr picked the wrong episode (often one that already had a file, giving "Not an upgrade") or none at all ("Failed to import"). VODgrab now tells Sonarr or Radarr exactly which episode or movie the file is for. If that episode or movie already has a file, only a higher-resolution file replaces it, and the reason is shown otherwise.
+- **Fix earlier failed imports:** in **History**, press **Retry import** on them. The retry uses the new exact import.
+- **Wanted stays up to date.** A movie or episode leaves the Wanted page as soon as it is imported, instead of at the next hourly check. Items you downloaded manually show their status: queued, downloading, or **Import failed** with the reason (click it to open History).
+- **Much faster with a big Radarr or Sonarr library.** Every Browse card and Wanted row checked "is this in Radarr/Sonarr" and "did VODgrab download it" by reading the whole library and download history. With 12,000 movies in Radarr, the Wanted page took 5 seconds (now 0.03 s) and a Browse page up to 0.7 s (now about 0.01 s).
+- **Smaller and fewer downloads for the browser:** pages, lists and Sonarr/Radarr indexer replies are compressed (the app page goes from 140 KB to 50 KB), the browser keeps the app page until VODgrab is updated, and a tab in the background stops checking for updates until you look at it again.
+- **Faster for Sonarr and Radarr:** new database indexes for the indexer's RSS feed and the download-client checks they make every minute. The Wanted check fetches episode lists from your providers a few at a time instead of one by one, and only asks the next provider when the better one doesn't have the episode. A Radarr search loads the details of every provider's copy at once.
+- Fewer error lines in the log: a page closed before it finished loading no longer logs a traceback, and the background metadata fill waits instead of failing while a catalog sync is writing.
+
 ## 1.15.0 (2026-11-07)
 
 - **Wanted: download manually.** Next to **Search in Radarr** and **Search N in Sonarr** there is now **Download manually** (per movie, per show, per episode, and for everything listed). It skips the Radarr or Sonarr search, so quality profiles and indexer settings can't get in the way: VODgrab downloads the best provider's copy right away (falling back to the others), then Radarr or Sonarr imports the file for the exact movie or series on the list. Rows show when they were queued, and pressing twice doesn't download twice.

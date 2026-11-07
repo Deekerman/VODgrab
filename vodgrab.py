@@ -5377,13 +5377,15 @@ def lib_sql(kind, a="t", tcol=None):
                 "EXISTS(SELECT 1 FROM overrides o JOIN %s x ON x.id=o.xid JOIN arr_lib l ON l.kind='%s' AND "
                 "l.%s=CAST(o.arr_id AS INTEGER) WHERE o.arr='%s' AND x.work=%s.work%s)"
                 % (k, tc, tc, unl, extra, k, a, a, a, unl, extra, table, k, col, arr, a, extra))
+    # From the title's copies to their jobs by job xid; going through the job status index instead read every
+    # finished download for every card.
     if kind == "movie":
-        vg = ("SELECT 1 FROM jobs j WHERE j.kind='movie' AND j.status IN ('imported','completed') AND j.xid IN "
-              "(SELECT id FROM movies x INDEXED BY movies_work WHERE x.work=%s.work)" % a)
+        vg = ("SELECT 1 FROM movies x INDEXED BY movies_work JOIN jobs j INDEXED BY jobs_xid ON j.xid=x.id "
+              "WHERE x.work=%s.work AND j.kind='movie' AND j.status IN ('imported','completed')" % a)
     else:
-        vg = ("SELECT 1 FROM jobs j JOIN episodes e ON e.id=j.xid WHERE j.kind='episode' AND "
-              "j.status IN ('imported','completed') AND e.series_id IN (SELECT id FROM series x INDEXED BY "
-              "series_work WHERE x.work=%s.work)" % a)
+        vg = ("SELECT 1 FROM series x INDEXED BY series_work JOIN episodes e ON e.series_id=x.id "
+              "JOIN jobs j INDEXED BY jobs_xid ON j.xid=e.id WHERE x.work=%s.work AND j.kind='episode' AND "
+              "j.status IN ('imported','completed')" % a)
     return m_sql(""), m_sql(" AND l.has_file=1"), vg
 
 
@@ -5641,13 +5643,27 @@ def letter_of(norm_):
     return c.upper() if "a" <= c <= "z" else "#"
 
 
+def counted(f, sql, args):
+    """Counts for the list total and the jump bar. They read every title, so they are kept until the catalog or
+    the library changes (the same moments the filter counts are dropped). Not kept with the library filter,
+    which also depends on downloads."""
+    if f.get("lib"):
+        return q(sql, *args)
+    key = ("count", sql, tuple(args))
+    if key not in _facet_cache:
+        if len(_facet_cache) > 2000:
+            _facet_cache.clear()
+        _facet_cache[key] = [dict(r) for r in q(sql, *args)]
+    return _facet_cache[key]
+
+
 def listing(f, sort, limit, offset, marks=False):
     parts, args, total = [], [], 0
     for frm, cols, kind in row_source(f):
         where, a = filter_sql(f, kind, f["merge"])
         parts.append("SELECT %s FROM %s WHERE %s" % (cols, frm, " AND ".join(where)))
         args += a
-        total += q1("SELECT COUNT(*) c FROM %s WHERE %s" % (frm, " AND ".join(where)), *a)["c"]
+        total += counted(f, "SELECT COUNT(*) c FROM %s WHERE %s" % (frm, " AND ".join(where)), a)[0]["c"]
     sql = "SELECT * FROM (%s) ORDER BY %s LIMIT ? OFFSET ?" % (" UNION ALL ".join(parts), SORTS.get(sort, SORTS["new"]))
     rows = q(sql, *(args + [limit, offset]))
     out = {"total": total, "items": [card(r) for r in rows], "suggest": [], "fuzzy": False}
@@ -5656,7 +5672,8 @@ def listing(f, sort, limit, offset, marks=False):
         groups = {}
         for frm, cols, kind in row_source(f):
             where, a = filter_sql(f, kind, f["merge"])
-            for r in q("SELECT %s g, COUNT(*) n FROM %s WHERE %s GROUP BY g" % (expr, frm, " AND ".join(where)), *a):
+            for r in counted(f, "SELECT %s g, COUNT(*) n FROM %s WHERE %s GROUP BY g"
+                             % (expr, frm, " AND ".join(where)), a):
                 groups[r["g"]] = groups.get(r["g"], 0) + r["n"]
         out["marks"] = jump_marks(groups, sort)
     return out
