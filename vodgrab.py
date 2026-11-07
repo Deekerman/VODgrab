@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -75,6 +75,8 @@ DEFAULTS = {
     "sonarr_profile_id": 0,
     "radarr_url": "",
     "radarr_api_key": "",
+    "radarr_link_url": "",
+    "sonarr_link_url": "",
     "radarr_root": "",
     "radarr_profile_id": 0,
     "sonarr_indexer_priority": 25,
@@ -364,7 +366,7 @@ def init_db():
        "year INTEGER, has_file INTEGER)")
     have = {r["name"] for r in q("PRAGMA table_info(arr_lib)")}
     for col, typ in (("monitored", "INTEGER DEFAULT 0"), ("available", "INTEGER DEFAULT 1"), ("title", "TEXT"),
-                     ("imdb", "TEXT")):
+                     ("imdb", "TEXT"), ("slug", "TEXT")):
         if col not in have:
             ex("ALTER TABLE arr_lib ADD COLUMN %s %s" % (col, typ))
     ex("CREATE TABLE IF NOT EXISTS wanted(kind TEXT, arr_id INTEGER, arr_ep INTEGER, work TEXT, season INTEGER, "
@@ -378,6 +380,7 @@ def init_db():
     ex("CREATE INDEX IF NOT EXISTS wanted_work ON wanted(kind, work)")
     ex("CREATE INDEX IF NOT EXISTS arr_lib_tmdb ON arr_lib(kind, tmdb)")
     ex("CREATE INDEX IF NOT EXISTS arr_lib_tvdb ON arr_lib(kind, tvdb)")
+    ex("CREATE INDEX IF NOT EXISTS arr_lib_id ON arr_lib(kind, arr_id)")  # Open in Radarr/Sonarr links
     ex("CREATE INDEX IF NOT EXISTS jobs_xid ON jobs(xid)")  # "VODgrab downloaded this" on every browse card
     ex("CREATE INDEX IF NOT EXISTS jobs_sab ON jobs(source, status, updated)")  # SAB queue and history polls
     ex("CREATE INDEX IF NOT EXISTS movies_added ON movies(added)")  # Newznab RSS: newest movies
@@ -1397,6 +1400,45 @@ def link_key(lib_row):
     return str(lib_row["tvdb"]) if lib_row["tvdb"] else None
 
 
+def arr_web(arr):
+    """Where the browser opens Radarr or Sonarr: the address for links from Settings, else the normal address."""
+    s = S()
+    return (s.get(arr + "_link_url") or s.get(arr + "_url") or "").strip().rstrip("/")
+
+
+def arr_page(kind, lib):
+    """Link to a movie's page in Radarr or a series' page in Sonarr, from an arr_lib row (None if unknown)."""
+    if not lib:
+        return None
+    arr = "radarr" if kind == "movie" else "sonarr"
+    base = arr_web(arr)
+    slug = lib["slug"] if "slug" in lib.keys() else None
+    if not base or not ARR(arr).ok():
+        return None
+    if kind == "movie":
+        slug = slug or lib["tmdb"]  # Radarr's movie pages are named by TMDB ID
+        return "%s/movie/%s" % (base, urllib.parse.quote(str(slug))) if slug else None
+    return "%s/series/%s" % (base, urllib.parse.quote(str(slug))) if slug else None
+
+
+def arr_page_by_id(kind, arr_id):
+    return arr_page(kind, q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, arr_id)) if arr_id else None
+
+
+def job_arr_page(j):
+    """The Radarr movie or Sonarr series a download is for, as a link (History)."""
+    meta = jmeta(j)
+    kind = "movie" if j["kind"] == "movie" else "series"
+    lib = None
+    if meta.get("arr_movie") or meta.get("arr_series"):
+        lib = q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, meta.get("arr_movie") or meta.get("arr_series"))
+    if not lib and meta.get("tmdb") and kind == "movie":
+        lib = q1("SELECT * FROM arr_lib WHERE kind='movie' AND tmdb=?", meta["tmdb"])
+    if not lib and meta.get("tvdb") and kind == "series":
+        lib = q1("SELECT * FROM arr_lib WHERE kind='series' AND tvdb=?", meta["tvdb"])
+    return arr_page(kind, lib)
+
+
 def arr_links(kind, xid):
     """The Radarr movies (or Sonarr series) a catalog title is linked to, and how."""
     arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
@@ -1419,7 +1461,7 @@ def arr_links(kind, xid):
             seen.add(r["arr_id"])
             out.append((r, "tmdb" if mt and r["tmdb"] == mt else "title"))
     return [{"arr": arr, "arr_id": r["arr_id"], "title": r["title"], "year": r["year"], "tmdb": r["tmdb"],
-             "imdb": r["imdb"], "tvdb": r["tvdb"], "has_file": bool(r["has_file"]), "monitored": bool(r["monitored"]),
+             "imdb": r["imdb"], "tvdb": r["tvdb"], "has_file": bool(r["has_file"]), "monitored": bool(r["monitored"]), "url": arr_page(kind, r),
              "how": how} for r, how in out]
 
 
@@ -1946,20 +1988,21 @@ def refresh_library(wanted=True):
             for m in RADARR.call("GET", "/api/v3/movie", timeout=120) or []:
                 rows.append(("movie", m.get("id"), to_int(m.get("tmdbId")), None, norm(m.get("title")),
                              to_int(m.get("year")), 1 if m.get("hasFile") else 0, 1 if m.get("monitored") else 0,
-                             1 if m.get("isAvailable", True) else 0, m.get("title") or "", m.get("imdbId") or None))
+                             1 if m.get("isAvailable", True) else 0, m.get("title") or "", m.get("imdbId") or None,
+                             m.get("titleSlug") or None))
         if SONARR.ok():
             for sr in SONARR.call("GET", "/api/v3/series", timeout=120) or []:
                 st = sr.get("statistics") or {}
                 rows.append(("series", sr.get("id"), to_int(sr.get("tmdbId")), to_int(sr.get("tvdbId")),
                              norm(sr.get("title")), to_int(sr.get("year")),
                              1 if (st.get("episodeFileCount") or 0) > 0 else 0, 1 if sr.get("monitored") else 0, 1,
-                             sr.get("title") or "", sr.get("imdbId") or None))
+                             sr.get("title") or "", sr.get("imdbId") or None, sr.get("titleSlug") or None))
         c = db()
         c.execute("BEGIN")
         try:
             c.execute("DELETE FROM arr_lib")
             c.executemany("INSERT INTO arr_lib(kind, arr_id, tmdb, tvdb, norm, year, has_file, monitored, available, "
-                          "title, imdb) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
+                          "title, imdb, slug) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
@@ -2232,9 +2275,13 @@ def wanted_view():
         jb = {"status": r["jst"], "error": r["jerr"] or ""} if r["jst"] else None
         if r["kind"] == "movie":
             movies.append({"arr_id": r["arr_id"], "title": r["title"], "card": c, "searched": r["searched"],
-                           "found": r["found"], "grabbed": r["grabbed"], "job": jb})
+                           "found": r["found"], "grabbed": r["grabbed"], "job": jb,
+                           "arr_url": arr_page_by_id("movie", r["arr_id"])})
         else:
-            sh = shows_ep.setdefault(r["arr_id"], {"arr_id": r["arr_id"], "card": c, "episodes": []})
+            if r["arr_id"] not in shows_ep:
+                shows_ep[r["arr_id"]] = {"arr_id": r["arr_id"], "card": c, "episodes": [],
+                                         "arr_url": arr_page_by_id("series", r["arr_id"])}
+            sh = shows_ep[r["arr_id"]]
             sh["episodes"].append({"arr_ep": r["arr_ep"], "season": r["season"], "episode": r["episode"],
                                    "title": r["title"], "air": r["air"], "available": bool(r["available"]),
                                    "searched": r["searched"], "found": r["found"],
@@ -5991,6 +6038,7 @@ def series_detail(sid):
              srow["year"])
     out["tvdb"] = lib["tvdb"] if lib else None
     out["in_sonarr"] = bool(lib)
+    out["arr_url"] = arr_page("series", lib)
     wanted = {(w["season"], w["episode"]): w["arr_ep"] for w in
               q("SELECT season, episode, arr_ep FROM wanted WHERE kind='series' AND work=?", srow["work"])}
     for se in out["seasons"]:
@@ -6059,6 +6107,7 @@ def job_row(j):
     d["probe"] = meta.get("probe")
     d["provider"] = pname(j["prov"]) if j["prov"] else ""
     d["sources"] = len(job_sources(j))
+    d["arr_url"] = job_arr_page(j) if j["status"] in ("failed", "import_failed", "imported", "completed") else None
     pr = ENGINE.progress.get(j["id"])
     if pr:
         d["done"], d["speed"] = pr["done"], pr["speed"]
@@ -7729,7 +7778,7 @@ function drawLinks(kind,id,links){const box=$("#linkSec");if(!box)return;
   const ids=l=>[l.imdb,l.tmdb?"TMDB "+l.tmdb:"",l.tvdb?"TVDB "+l.tvdb:""].filter(Boolean).join(" · ");
   box.innerHTML=`<h4>Linked in ${A}</h4>${links.length?links.map(l=>`<div class="src"><span class="pn">${esc(l.title)}${l.year?` (${l.year})`:""}</span>
       <span class="mi">${esc([ids(l),how[l.how],l.has_file?"has a file":"no file yet"].filter(Boolean).join(" · "))}</span>
-      <button class="btn s d" data-un="${l.arr_id}">Not this ${w}</button></div>`).join(""):`<div class="muted">Not linked to anything in ${A}. VODgrab will not offer this title to ${A}.</div>`}
+      ${l.url?`<a class="btn s" href="${esc(l.url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in ${A}</a>`:""}<button class="btn s d" data-un="${l.arr_id}">Not this ${w}</button></div>`).join(""):`<div class="muted">Not linked to anything in ${A}. VODgrab will not offer this title to ${A}.</div>`}
     <div class="tools" style="margin:8px 0 0"><button class="btn s" id="lnkChg">Link to a different ${w}…</button></div><div id="lnkPick"></div>`;
   $$("[data-un]",box).forEach(b=>b.onclick=async()=>{const l=links.find(y=>y.arr_id==b.dataset.un);
     if(!confirm(`This title is not ${A}'s "${l.title}${l.year?" ("+l.year+")":""}"?\n\nVODgrab will stop offering it to ${A} for that ${w} and remove it from Wanted.`))return;
@@ -7746,7 +7795,8 @@ async function openMovie(id){
   let x;try{x=await api("movie/"+id)}catch(e){toast(e.message,1);closeModal();return}
   const m=x.meta||{};
   const lib=x.library?(x.library.has_file?`<span class="st imported">In Radarr with file</span>`:x.library.in_radarr?`<span class="st queued">In Radarr, no file</span>`:""):"";
-  const acts=`${lib}${x.job?st(x.job.status):""}${status.arrs&&status.arrs.radarr&&!(x.library&&x.library.in_radarr)?`<button class="btn s" id="addm">+ Add to Radarr</button>`:""}`;
+  const ou=(x.links||[]).find(l=>l.url);
+  const acts=`${lib}${x.job?st(x.job.status):""}${status.arrs&&status.arrs.radarr&&!(x.library&&x.library.in_radarr)&&!ou?`<button class="btn s" id="addm">+ Add to Radarr</button>`:""}${ou?`<a class="btn s" href="${esc(ou.url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in Radarr</a>`:""}`;
   const col=m.collection?`<div class="sec"><h4>${esc(m.collection.name)}</h4><div class="scroller">${m.collection.parts.map(p=>`<div class="mini${p.id?"":" na"}${p.current?" cur":""}" ${p.id&&!p.current?`data-open="movie:${p.id}"`:""} title="${p.id?"":"Not on your providers"}"><div class="mp" style="${p.poster?`background-image:url('${esc(p.poster)}')`:""}">${p.lib?`<div class="bdg"><span class="lb ${p.lib=="has_file"?"lb2":"lb1"}">${p.lib=="has_file"?"Have it":"In Radarr"}</span></div>`:""}</div><div class="mt">${esc(p.title)}</div><div class="my">${p.year||""}${p.id?"":" · not on providers"}</div></div>`).join("")}</div></div>`:"";
   const plot=m.overview||x.plot||"";
   modal(heroHtml("movie",x.clean,m,{year:x.year,poster:x.poster,rating:x.rating},acts)+`<div class="sb"><div id="trbox"></div><div id="playbox"></div>
@@ -7800,7 +7850,7 @@ async function openSeries(id){
     $$("#eps [data-e]").forEach(b=>b.onclick=async()=>{b.disabled=true;await dl({kind:"episode",id:+b.dataset.e,now:$("#now").checked})});
     $$("#eps [data-pl]").forEach(b=>b.onclick=()=>{const e=se.episodes.find(y=>y.id==+b.dataset.pl);play("episode",e.id,`${x.clean} S${String(e.season).padStart(2,"0")}E${String(e.episode).padStart(2,"0")}${e.tname||e.title?" · "+(e.tname||e.title):""}`,[e.media.quality,e.media.codec,e.ext].filter(Boolean).join(" · "))});
     if(se)checkSeason(se)};
-  const acts=`${status.arrs&&status.arrs.sonarr&&!x.in_sonarr?`<button class="btn s" id="adds">+ Add to Sonarr</button>`:x.in_sonarr?`<span class="st imported">In Sonarr</span>`:""}`;
+  const acts=`${status.arrs&&status.arrs.sonarr&&!x.in_sonarr?`<button class="btn s" id="adds">+ Add to Sonarr</button>`:x.in_sonarr?`<span class="st imported">In Sonarr</span>`:""}${x.arr_url?`<a class="btn s" href="${esc(x.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in Sonarr</a>`:""}`;
   const avail=x.seasons.reduce((n,s)=>n+s.episodes.filter(e=>!e.missing).length,0),miss=x.seasons.reduce((n,s)=>n+s.episodes.filter(e=>e.missing).length,0);
   modal(heroHtml("series",x.clean,m,{year:x.year,poster:x.icon,rating:x.rating},acts)+`<div class="sb"><div id="trbox"></div>
     ${m.overview||x.plot?`<p class="ovw">${esc(m.overview||x.plot)}</p>`:""}${noMeta(m)}
@@ -7895,11 +7945,11 @@ function wDraw(){const box=$("#wlist");if(!box)return;wWriteHash();
   const nE=ids.e.length;
   box.innerHTML=(movies.length?`<h3 class="wh">Movies <span class="muted">${movies.length}</span></h3><div class="list">${movies.map(x=>`<div class="row" data-l="${skl(x.card.clean)}"><div class="main"><div class="title">${esc(x.card.clean)} ${x.card.year?`<span class="muted">(${x.card.year})</span>`:""}</div>
       <div class="sub">${x.card.quality?`<span class="q k${x.card.quality}">${x.card.quality=="2160p"?"4K":x.card.quality}</span> `:""}${esc(x.card.providers.join(", "))} ${srch(x.searched,x.grabbed,x.job)}</div></div>
-      <div class="acts"><button class="btn s" data-open-m="${x.card.id}">Details</button><button class="btn s p" data-sm="${x.arr_id}">Search in Radarr</button><button class="btn s" data-gm="${x.arr_id}">Download manually</button></div></div>`).join("")}</div>`:"")+
+      <div class="acts"><button class="btn s" data-open-m="${x.card.id}">Details</button>${x.arr_url?`<a class="btn s" href="${esc(x.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in Radarr</a>`:""}<button class="btn s p" data-sm="${x.arr_id}">Search in Radarr</button><button class="btn s" data-gm="${x.arr_id}">Download manually</button></div></div>`).join("")}</div>`:"")+
     (shows.length?`<h3 class="wh">Episodes <span class="muted">${nE} in ${shows.length} show${shows.length==1?"":"s"}</span></h3><div class="list">${shows.map((s,i)=>{const av=s.shown.filter(e=>e.available).length;return `<div class="row" style="display:block" data-l="${skl(s.card.clean)}">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><div class="main"><div class="title">${esc(s.card.clean)} ${s.card.year?`<span class="muted">(${s.card.year})</span>`:""}</div>
       <div class="sub">${s.available} of ${s.missing} missing episode${s.missing==1?"":"s"} available · ${esc(s.card.providers.join(", "))}</div></div>
-      <div class="acts"><button class="btn s" data-exp="${i}">Episodes</button><button class="btn s" data-open-s="${s.card.id}">Details</button><button class="btn s p" data-ss="${i}">Search ${av} in Sonarr</button><button class="btn s" data-gs="${i}">Download ${av} manually</button></div></div>
+      <div class="acts"><button class="btn s" data-exp="${i}">Episodes</button><button class="btn s" data-open-s="${s.card.id}">Details</button>${s.arr_url?`<a class="btn s" href="${esc(s.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in Sonarr</a>`:""}<button class="btn s p" data-ss="${i}">Search ${av} in Sonarr</button><button class="btn s" data-gs="${i}">Download ${av} manually</button></div></div>
       <div class="eps" data-eps="${i}" ${WF.q||shows.length==1?"":"hidden"}>${s.shown.map(e=>`<div class="ep${e.available?"":" na"}"><span class="n">S${String(e.season).padStart(2,"0")}E${String(e.episode).padStart(2,"0")}</span><span class="et">${esc(e.title)}${e.air?` <span class="muted" style="font-size:12px">· ${new Date(e.air).toLocaleDateString()}</span>`:""}</span>
         ${e.available?`${srch(e.searched,e.grabbed,e.job)}<button class="btn s" data-se="${e.arr_ep}">Search</button><button class="btn s" data-ge="${e.arr_ep}">Download</button>`:`<span class="muted" style="font-size:12px">Not on any provider</span>`}</div>`).join("")}</div></div>`}).join("")}</div>`:"")+
     ((W.sonarr||W.radarr)&&!movies.length&&!shows.length?`<div class="empty">${!W.at?"Press Refresh to check.":W.movies.length+W.shows.length?"Nothing matches these filters.":"Nothing Sonarr or Radarr wants is on your providers right now."}</div>`:"");
@@ -7934,7 +7984,7 @@ async function renderHistory(){
     <div class="sub"><span class="tag">${j.source=="arr"?esc(j.arr):"Manual"}</span>${j.provider?`<span class="tag">${esc(j.provider)}</span>`:""}${st(j.status)} ${j.total?fb(j.total)+" · ":""}${j.probe?esc(j.probe)+" · ":""}${ago(j.updated)}</div>
     ${j.error?`<div class="sub" style="color:${["failed","import_failed"].includes(j.status)?"var(--bad)":"var(--dim)"}">${esc(j.error)}</div>`:""}
     <div class="sub">${esc(j.release)}</div></div>
-    <div class="acts">${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
+    <div class="acts">${j.arr_url?`<a class="btn s" href="${esc(j.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in ${j.kind=="movie"?"Radarr":"Sonarr"}</a>`:""}${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
     <button class="btn s d" data-a="delete" data-id="${j.id}">${j.status=="import_failed"?"Delete file":"Remove"}</button></div></div>`).join("")}</div>`:`<div class="empty">No history yet.</div>`);
   $$("[data-clr]",m).forEach(b=>b.onclick=async()=>{const w=b.dataset.clr;
     if(!confirm(`Remove ${w=="all"?"all":w} entries from History?\n\nDownloaded files are not touched. Downloads Radarr or Sonarr haven't imported yet are kept.`))return;
@@ -7996,6 +8046,7 @@ async function renderSettings(){
   SV=await api("settings");const s=SV.settings;const m=$("#main");
   const arrSec=(a,L)=>`<section class="set"><h3>${L}</h3><div class="fields">
     ${fld(a+"_url","URL","text","For example http://10.0.0.20:"+(a=="sonarr"?"8989":"7878"))}${fld(a+"_api_key","API key","secret")}
+    ${fld(a+"_link_url","Address for links (optional)","text","Where your browser opens "+L+" for the Open in "+L+" buttons. Only needed when the URL above works for VODgrab but not for your browser, for example http://"+a+":"+(a=="sonarr"?"8989":"7878")+" inside Docker. Use the address you type to open "+L+", such as http://192.168.1.10:"+(a=="sonarr"?"8989":"7878")+" or your reverse-proxy URL.")}
     <div class="f"><label>Library folder for new ${a=="sonarr"?"shows":"movies"}</label><input id="s_${a}_root" list="dl_${a}" value="${esc(s[a+"_root"])}" placeholder="${L}'s first root folder"><datalist id="dl_${a}"></datalist>
       <div class="hint">Used when VODgrab adds ${a=="sonarr"?"a show":"a movie"} to ${L}: the Add to ${L} button, and manual downloads of titles ${L} doesn't have yet. Pick one of ${L}'s root folders.</div></div>
     <div class="f"><label>Quality profile for new ${a=="sonarr"?"shows":"movies"}</label><select id="s_${a}_profile_id"><option value="0">First profile</option></select><div class="hint">The quality ${L} aims for on titles VODgrab adds. Press Load from ${L} to list its profiles.</div></div>

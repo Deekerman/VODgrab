@@ -2,12 +2,18 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.1 (2026-11-07)
+
+- **Open in Radarr / Open in Sonarr** buttons: in a movie's or show's details (also next to each title under **Linked in Radarr**), on Wanted rows, and in History, so you can jump straight to the item Radarr or Sonarr is looking at, for example to see why an import was refused.
+- New optional **Address for links** for Radarr and Sonarr in Settings. Fill it in when the URL VODgrab uses doesn't open in your browser (for example `http://radarr:7878` inside Docker): use the address you normally type, such as `http://192.168.1.10:7878` or your reverse-proxy URL.
+- Sonarr show links appear after VODgrab's next check of your Sonarr library (at startup, then hourly).
+
 ## 1.16.0 (2026-11-07)
 
 - **Manual downloads import into the right episode.** VODgrab used to hand Sonarr the file and let it work out the episode from the file name. For shows with scene numbering on TheXEM, or several shows with the same title, Sonarr picked the wrong episode (often one that already had a file, giving "Not an upgrade") or none at all ("Failed to import"). VODgrab now tells Sonarr or Radarr exactly which episode or movie the file is for. If that episode or movie already has a file, only a higher-resolution file replaces it, and the reason is shown otherwise.
 - **Fix earlier failed imports:** in **History**, press **Retry import** on them. The retry uses the new exact import.
 - **Wanted stays up to date.** A movie or episode leaves the Wanted page as soon as it is imported, instead of at the next hourly check. Items you downloaded manually show their status: queued, downloading, or **Import failed** with the reason (click it to open History).
-- **Much faster with a big Radarr or Sonarr library.** Every Browse card and Wanted row checked "is this in Radarr/Sonarr" and "did VODgrab download it" by reading the whole library and download history. With 12,000 movies in Radarr, the Wanted page took 5 seconds (now 0.03 s) and a Browse page up to 0.7 s (now about 0.01 s).
+- **Much faster with a big Radarr or Sonarr library.** Every Browse card and Wanted row checked "is this in Radarr/Sonarr" and "did VODgrab download it" by reading the whole library and download history. With 12,000 movies in Radarr, the Wanted page took 5 seconds (now 0.03 s), a Browse page up to 0.7 s (now about 0.01 s), and the Browse "Missing" filter almost 6 minutes (now 0.08 s). The Wanted check runs about 2.5 times faster.
 - **Smaller and fewer downloads for the browser:** pages, lists and Sonarr/Radarr indexer replies are compressed (the app page goes from 140 KB to 50 KB), the browser keeps the app page until VODgrab is updated, and a tab in the background stops checking for updates until you look at it again.
 - **Faster for Sonarr and Radarr:** new database indexes for the indexer's RSS feed and the download-client checks they make every minute. The Wanted check fetches episode lists from your providers a few at a time instead of one by one, and only asks the next provider when the better one doesn't have the episode. A Radarr search loads the details of every provider's copy at once.
 - Fewer error lines in the log: a page closed before it finished loading no longer logs a traceback, and the background metadata fill waits instead of failing while a catalog sync is writing.
