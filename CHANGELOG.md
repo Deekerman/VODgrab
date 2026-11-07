@@ -2,6 +2,10 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.15.0 (2026-11-07)
+
+- **Wanted: download manually.** Next to **Search in Radarr** and **Search N in Sonarr** there is now **Download manually** (per movie, per show, per episode, and for everything listed). It skips the Radarr or Sonarr search, so quality profiles and indexer settings can't get in the way: VODgrab downloads the best provider's copy right away (falling back to the others), then Radarr or Sonarr imports the file for the exact movie or series on the list. Rows show when they were queued, and pressing twice doesn't download twice.
+
 ## 1.14.0 (2026-10-16)
 
 - **Unreachable providers no longer cause endless retries.** After two connection failures in a row (name not found, refused, timed out), a provider is marked down. VODgrab stops using it for downloads, quality checks and lookups, stops offering its copies to Radarr and Sonarr (so they don't grab them over and over), and checks it again after 15 min, 30 min, 1 h, 2 h, 4 h, then every 6 h. One log line when it goes down, one when it is back. The banner and the provider card show it.

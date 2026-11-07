@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -369,6 +369,8 @@ def init_db():
             ex("ALTER TABLE arr_lib ADD COLUMN %s %s" % (col, typ))
     ex("CREATE TABLE IF NOT EXISTS wanted(kind TEXT, arr_id INTEGER, arr_ep INTEGER, work TEXT, season INTEGER, "
        "episode INTEGER, title TEXT, air TEXT, available INTEGER, found REAL, searched REAL)")
+    if "grabbed" not in {r["name"] for r in q("PRAGMA table_info(wanted)")}:
+        ex("ALTER TABLE wanted ADD COLUMN grabbed REAL")
     ex("CREATE INDEX IF NOT EXISTS wanted_work ON wanted(kind, work)")
     ex("CREATE INDEX IF NOT EXISTS arr_lib_tmdb ON arr_lib(kind, tmdb)")
     ex("CREATE INDEX IF NOT EXISTS arr_lib_norm ON arr_lib(kind, norm)")
@@ -2039,10 +2041,10 @@ def refresh_wanted():
             for kind, aid, ep_id, work, se, ep, title, air, avail in rows:
                 prev = old.get((kind, aid, ep_id))
                 c.execute("INSERT INTO wanted(kind, arr_id, arr_ep, work, season, episode, title, air, available, "
-                          "found, searched) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                          "found, searched, grabbed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                           (kind, aid, ep_id, work, se, ep, title, air, avail,
                            prev["found"] if prev and prev["available"] == avail else now,
-                           prev["searched"] if prev else None))
+                           prev["searched"] if prev else None, prev["grabbed"] if prev else None))
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
@@ -2088,6 +2090,77 @@ def wanted_search(movie_ids, episode_ids, auto=False):
     return done
 
 
+def wanted_grab(movie_ids, episode_ids):
+    """Download what Radarr and Sonarr want straight away (no arr search), then import it like any manual download."""
+    done = {"movies": 0, "episodes": 0, "skipped": 0, "notes": []}
+    now = time.time()
+
+    def skip(what, why):
+        done["skipped"] += 1
+        if len(done["notes"]) < 8:
+            done["notes"].append("%s: %s" % (what, why))
+
+    for aid in [int(x) for x in movie_ids or []]:
+        w = q1("SELECT * FROM wanted WHERE kind='movie' AND arr_id=?", aid)
+        if not w:
+            continue
+        lib = q1("SELECT * FROM arr_lib WHERE kind='movie' AND arr_id=?", aid)
+        ids = sorted([r["id"] for r in q("SELECT id FROM movies WHERE work=? AND %s%s" % (live(True), not_down()),
+                                         w["work"])], key=prio)
+        if not ids:
+            skip(w["title"], "no provider has it right now")
+            continue
+        info = {"id": aid, "tmdbId": lib["tmdb"], "title": lib["title"] or w["title"], "year": lib["year"]} \
+            if lib and lib["tmdb"] else None
+        try:
+            enqueue_manual("movie", ids[0], arr_info=info)
+        except Exception as e:
+            skip(w["title"], e)
+            continue
+        ex("UPDATE wanted SET grabbed=? WHERE kind='movie' AND arr_id=?", now, aid)
+        done["movies"] += 1
+    by_series = collections.defaultdict(list)
+    for ep_id in [int(x) for x in episode_ids or []]:
+        w = q1("SELECT * FROM wanted WHERE kind='series' AND arr_ep=?", ep_id)
+        if w:
+            by_series[w["arr_id"]].append(w)
+    for aid, rows in by_series.items():
+        lib = q1("SELECT * FROM arr_lib WHERE kind='series' AND arr_id=?", aid)
+        info = {"id": aid, "tvdbId": lib["tvdb"], "title": lib["title"], "year": lib["year"]} \
+            if lib and lib["tvdb"] else None
+        copies = sorted([r["id"] for r in q("SELECT id FROM series INDEXED BY series_work WHERE work=? AND %s%s"
+                                            % (live(True), not_down()), rows[0]["work"])], key=prio)
+        found = {}
+        for sid in copies:
+            try:
+                ensure_episodes(sid)
+            except Exception as e:
+                if not isinstance(e, ProviderDown):
+                    log("Episode list for %s failed: %s" % (pname(dec(sid)[0]), e), "warn")
+            for e in q("SELECT id, season, episode FROM episodes WHERE series_id=?", sid):
+                found.setdefault((e["season"], e["episode"]), e["id"])
+            if all((w["season"], w["episode"]) in found for w in rows):
+                break
+        show = (lib and lib["title"]) or "Series"
+        for w in rows:
+            label = "%s S%02dE%02d" % (show, w["season"] or 0, w["episode"] or 0)
+            eid = found.get((w["season"], w["episode"]))
+            if not eid:
+                skip(label, "no provider has it right now")
+                continue
+            try:
+                enqueue_manual("episode", eid, arr_info=info)
+            except Exception as e:
+                skip(label, e)
+                continue
+            ex("UPDATE wanted SET grabbed=? WHERE kind='series' AND arr_ep=?", now, w["arr_ep"])
+            done["episodes"] += 1
+    log("Queued %d movies and %d episodes from Wanted for download%s" % (
+        done["movies"], done["episodes"], " (%d skipped)" % done["skipped"] if done["skipped"] else ""))
+    done["notes"] = [mask(str(n)) for n in done["notes"]]
+    return done
+
+
 def wanted_view():
     shows_ep = collections.OrderedDict()
     movies = []
@@ -2106,12 +2179,13 @@ def wanted_view():
             continue
         if r["kind"] == "movie":
             movies.append({"arr_id": r["arr_id"], "title": r["title"], "card": c, "searched": r["searched"],
-                           "found": r["found"]})
+                           "found": r["found"], "grabbed": r["grabbed"]})
         else:
             sh = shows_ep.setdefault(r["arr_id"], {"arr_id": r["arr_id"], "card": c, "episodes": []})
             sh["episodes"].append({"arr_ep": r["arr_ep"], "season": r["season"], "episode": r["episode"],
                                    "title": r["title"], "air": r["air"], "available": bool(r["available"]),
-                                   "searched": r["searched"], "found": r["found"]})
+                                   "searched": r["searched"], "found": r["found"],
+                                   "grabbed": r["grabbed"]})
     shows = []
     for sh in shows_ep.values():
         sh["episodes"].sort(key=lambda e: (e["season"] or 0, e["episode"] or 0))
@@ -2717,7 +2791,8 @@ def add_many(items):
             "failed": sum(1 for r in out if not r["ok"])}
 
 
-def enqueue_manual(kind, xid, season=None, force=False, dp=None):
+def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None):
+    """arr_info: the Radarr movie or Sonarr series this is for, when already known (the Wanted page)."""
     notes = []
     if kind == "movie":
         m = q1("SELECT * FROM movies WHERE id=?", xid)
@@ -2726,7 +2801,7 @@ def enqueue_manual(kind, xid, season=None, force=False, dp=None):
         title, year, meta = m["clean"], m["year"], {}
         if RADARR.ok() and S()["auto_import_manual"]:
             try:
-                info = resolve_radarr(m)
+                info = arr_info or resolve_radarr(m)
                 if info:
                     title, year = info.get("title") or title, info.get("year") or year
                     meta = {"tmdb": info.get("tmdbId"), "arr_title": title}
@@ -2761,7 +2836,7 @@ def enqueue_manual(kind, xid, season=None, force=False, dp=None):
         title, meta = srow["clean"], {}
         if SONARR.ok() and S()["auto_import_manual"]:
             try:
-                info = resolve_sonarr(srow)
+                info = arr_info or resolve_sonarr(srow)
                 if info:
                     title = info.get("title") or title
                     meta = {"tvdb": info.get("tvdbId"), "arr_title": title}
@@ -6168,6 +6243,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"ok": True})
             if len(parts) > 1 and parts[1] == "search" and method == "POST":
                 return self.send(200, wanted_search(data.get("movies"), data.get("episodes")))
+            if len(parts) > 1 and parts[1] == "grab" and method == "POST":
+                return self.send(200, wanted_grab(data.get("movies"), data.get("episodes")))
             return self.send(200, wanted_view())
         if a == "facets":
             return self.send(200, facets(qs))
@@ -7549,7 +7626,7 @@ async function renderWanted(){
   try{W=await api("wanted")}catch(e){m.innerHTML=`<div class="empty">${esc(e.message)}</div>`;return}
   if(tab!="wanted")return;
   const provs=[...new Set([...W.movies.map(x=>x.card.providers),...W.shows.map(s=>s.card.providers)].flat())].sort();
-  m.innerHTML=`<p class="muted">Movies and episodes Radarr and Sonarr are waiting for (monitored, released or aired, no file) that a provider has. Search asks the arr to look, so it grabs through VODgrab using your quality profiles.</p>
+  m.innerHTML=`<p class="muted">Movies and episodes Radarr and Sonarr are waiting for (monitored, released or aired, no file) that a provider has. Search asks the arr to look, so it grabs through VODgrab using your quality profiles. Download manually skips that search: VODgrab downloads it right away and Radarr or Sonarr imports the file.</p>
     <div class="tools">
       <div class="seg" id="wArr"><button data-v="all">Both</button><button data-v="radarr" ${W.radarr?"":"disabled"}>Radarr</button><button data-v="sonarr" ${W.sonarr?"":"disabled"}>Sonarr</button></div>
       <input type="search" id="wq" placeholder="Filter by title" value="${esc(WF.q)}" autocomplete="off">
@@ -7558,7 +7635,7 @@ async function renderWanted(){
       <select id="wsort"><option value="title">Title</option><option value="found">Newest found</option><option value="date">Air or release date</option></select>
       <label class="muted" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="wfresh" ${WF.fresh?"checked":""}> Not searched yet</label>
       <label class="muted" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="wna" ${WF.na?"checked":""}> Show episodes no provider has</label></div>
-    <div class="tools"><button class="btn p" id="wAll">Search</button><button class="btn" id="wRef">Refresh</button>
+    <div class="tools"><button class="btn p" id="wAll">Search</button><button class="btn" id="wGrab">Download</button><button class="btn" id="wRef">Refresh</button>
       <span class="muted">${W.running?"Refreshing…":W.at?"Checked "+ago(W.at):"Not checked yet"}${W.error?" · "+esc(W.error):""} · Automatic search ${W.auto?"on":"off"} <a href="#settings" onclick="go('settings');return false">change</a></span></div>
     ${!W.sonarr&&!W.radarr?`<div class="empty">Connect Sonarr or Radarr in Settings to see what they want.</div>`:""}
     <div id="wlist"></div>`;
@@ -7591,21 +7668,26 @@ function wDraw(){const box=$("#wlist");if(!box)return;wWriteHash();
   const btn=$("#wAll"),n=ids.m.length+ids.e.length;
   btn.disabled=!n;btn.textContent=n?`Search these ${n} in ${WF.arr=="radarr"?"Radarr":WF.arr=="sonarr"?"Sonarr":"Sonarr and Radarr"}`:"Nothing to search";
   btn.onclick=e=>{if(confirm(`Ask ${ids.m.length?`Radarr to search ${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`Sonarr to search ${ids.e.length} episode${ids.e.length==1?"":"s"}`:""}?`))wGo(ids.m,ids.e,e.target)};
-  const srch=t=>t?`<span class="muted" style="font-size:12px">searched ${ago(t)}</span>`:"";
+  const gb=$("#wGrab");gb.disabled=!n;gb.textContent=n?`Download these ${n} manually`:"Nothing to download";
+  gb.onclick=e=>{if(confirm(`Download ${ids.m.length?`${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`${ids.e.length} episode${ids.e.length==1?"":"s"}`:""} with VODgrab now, without a Radarr or Sonarr search? They are imported when done.`))wGrab(ids.m,ids.e,e.target)};
+  const srch=(t,g)=>(t?`<span class="muted" style="font-size:12px">searched ${ago(t)}</span>`:"")+(g?`<span class="muted" style="font-size:12px">${t?" · ":""}queued in VODgrab ${ago(g)}</span>`:"");
   const nE=ids.e.length;
   box.innerHTML=(movies.length?`<h3 class="wh">Movies <span class="muted">${movies.length}</span></h3><div class="list">${movies.map(x=>`<div class="row" data-l="${skl(x.card.clean)}"><div class="main"><div class="title">${esc(x.card.clean)} ${x.card.year?`<span class="muted">(${x.card.year})</span>`:""}</div>
-      <div class="sub">${x.card.quality?`<span class="q k${x.card.quality}">${x.card.quality=="2160p"?"4K":x.card.quality}</span> `:""}${esc(x.card.providers.join(", "))} ${srch(x.searched)}</div></div>
-      <div class="acts"><button class="btn s" data-open-m="${x.card.id}">Details</button><button class="btn s p" data-sm="${x.arr_id}">Search in Radarr</button></div></div>`).join("")}</div>`:"")+
+      <div class="sub">${x.card.quality?`<span class="q k${x.card.quality}">${x.card.quality=="2160p"?"4K":x.card.quality}</span> `:""}${esc(x.card.providers.join(", "))} ${srch(x.searched,x.grabbed)}</div></div>
+      <div class="acts"><button class="btn s" data-open-m="${x.card.id}">Details</button><button class="btn s p" data-sm="${x.arr_id}">Search in Radarr</button><button class="btn s" data-gm="${x.arr_id}">Download manually</button></div></div>`).join("")}</div>`:"")+
     (shows.length?`<h3 class="wh">Episodes <span class="muted">${nE} in ${shows.length} show${shows.length==1?"":"s"}</span></h3><div class="list">${shows.map((s,i)=>{const av=s.shown.filter(e=>e.available).length;return `<div class="row" style="display:block" data-l="${skl(s.card.clean)}">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><div class="main"><div class="title">${esc(s.card.clean)} ${s.card.year?`<span class="muted">(${s.card.year})</span>`:""}</div>
       <div class="sub">${s.available} of ${s.missing} missing episode${s.missing==1?"":"s"} available · ${esc(s.card.providers.join(", "))}</div></div>
-      <div class="acts"><button class="btn s" data-exp="${i}">Episodes</button><button class="btn s" data-open-s="${s.card.id}">Details</button><button class="btn s p" data-ss="${i}">Search ${av} in Sonarr</button></div></div>
+      <div class="acts"><button class="btn s" data-exp="${i}">Episodes</button><button class="btn s" data-open-s="${s.card.id}">Details</button><button class="btn s p" data-ss="${i}">Search ${av} in Sonarr</button><button class="btn s" data-gs="${i}">Download ${av} manually</button></div></div>
       <div class="eps" data-eps="${i}" ${WF.q||shows.length==1?"":"hidden"}>${s.shown.map(e=>`<div class="ep${e.available?"":" na"}"><span class="n">S${String(e.season).padStart(2,"0")}E${String(e.episode).padStart(2,"0")}</span><span class="et">${esc(e.title)}${e.air?` <span class="muted" style="font-size:12px">· ${new Date(e.air).toLocaleDateString()}</span>`:""}</span>
-        ${e.available?`${srch(e.searched)}<button class="btn s" data-se="${e.arr_ep}">Search</button>`:`<span class="muted" style="font-size:12px">Not on any provider</span>`}</div>`).join("")}</div></div>`}).join("")}</div>`:"")+
+        ${e.available?`${srch(e.searched,e.grabbed)}<button class="btn s" data-se="${e.arr_ep}">Search</button><button class="btn s" data-ge="${e.arr_ep}">Download</button>`:`<span class="muted" style="font-size:12px">Not on any provider</span>`}</div>`).join("")}</div></div>`}).join("")}</div>`:"")+
     ((W.sonarr||W.radarr)&&!movies.length&&!shows.length?`<div class="empty">${!W.at?"Press Refresh to check.":W.movies.length+W.shows.length?"Nothing matches these filters.":"Nothing Sonarr or Radarr wants is on your providers right now."}</div>`:"");
   $$("[data-sm]",box).forEach(b=>b.onclick=()=>wGo([+b.dataset.sm],[],b));
   $$("[data-ss]",box).forEach(b=>b.onclick=()=>wGo([],shows[+b.dataset.ss].shown.filter(e=>e.available).map(e=>e.arr_ep),b));
   $$("[data-se]",box).forEach(b=>b.onclick=()=>wGo([],[+b.dataset.se],b));
+  $$("[data-gm]",box).forEach(b=>b.onclick=()=>wGrab([+b.dataset.gm],[],b));
+  $$("[data-gs]",box).forEach(b=>b.onclick=()=>wGrab([],shows[+b.dataset.gs].shown.filter(e=>e.available).map(e=>e.arr_ep),b));
+  $$("[data-ge]",box).forEach(b=>b.onclick=()=>wGrab([],[+b.dataset.ge],b));
   $$("[data-exp]",box).forEach(b=>b.onclick=()=>{const d=$(`[data-eps="${b.dataset.exp}"]`,box);d.hidden=!d.hidden});
   $$("[data-open-m]",box).forEach(b=>b.onclick=()=>openMovie(+b.dataset.openM));
   $$("[data-open-s]",box).forEach(b=>b.onclick=()=>openSeries(+b.dataset.openS));
@@ -7614,6 +7696,11 @@ function wDraw(){const box=$("#wlist");if(!box)return;wWriteHash();
   else hideRail()}
 async function wGo(movies,episodes,btn){if(btn)btn.disabled=true;
   try{const r=await api("wanted/search",{movies,episodes});toast(`Asked Radarr to search ${r.movies} movie${r.movies==1?"":"s"} and Sonarr to search ${r.episodes} episode${r.episodes==1?"":"s"}`);renderWanted()}
+  catch(e){toast(e.message,1);if(btn)btn.disabled=false}}
+async function wGrab(movies,episodes,btn){if(btn)btn.disabled=true;
+  try{const r=await api("wanted/grab",{movies,episodes});const q=r.movies+r.episodes;
+    toast(q?`Queued ${r.movies?`${r.movies} movie${r.movies==1?"":"s"}`:""}${r.movies&&r.episodes?" and ":""}${r.episodes?`${r.episodes} episode${r.episodes==1?"":"s"}`:""} for download${r.skipped?` · ${r.skipped} skipped: ${r.notes.join("; ")}`:""}`:`Nothing queued${r.notes.length?": "+r.notes.join("; "):""}`,!q);
+    renderWanted();refreshStatus()}
   catch(e){toast(e.message,1);if(btn)btn.disabled=false}}
 
 /* ---------------- history */

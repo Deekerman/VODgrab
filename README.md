@@ -23,7 +23,7 @@ It is VERY important to note, this was made entirely by AI.
 
 - **Works with Sonarr and Radarr as they are.** It acts as a Newznab indexer and a SABnzbd API, with one-click setup that adds itself to both apps.
 - **Catalog browser.** Posters, ratings, quality badges, filters, search, and movie and series detail pages with per-episode downloads.
-- **Wanted list.** Shows what Sonarr and Radarr are missing that your provider has, and can search for it automatically.
+- **Wanted list.** Shows what Sonarr and Radarr are missing that your provider has, and can search for it automatically, or download it straight away without a search and let Sonarr or Radarr import it.
 - **Multiple providers.** Set a priority order and connection limits. If a download fails on one provider, the next one is tried.
 - **Reliable downloads.** Resumes interrupted transfers, retries with backoff, has a speed limit, and checks files with ffprobe.
 - **Download schedule.** Only download during the time windows you set, with pause and resume.
