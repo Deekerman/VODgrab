@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -369,10 +369,19 @@ def init_db():
             ex("ALTER TABLE arr_lib ADD COLUMN %s %s" % (col, typ))
     ex("CREATE TABLE IF NOT EXISTS wanted(kind TEXT, arr_id INTEGER, arr_ep INTEGER, work TEXT, season INTEGER, "
        "episode INTEGER, title TEXT, air TEXT, available INTEGER, found REAL, searched REAL)")
-    if "grabbed" not in {r["name"] for r in q("PRAGMA table_info(wanted)")}:
-        ex("ALTER TABLE wanted ADD COLUMN grabbed REAL")
+    have = {r["name"] for r in q("PRAGMA table_info(wanted)")}
+    for col, typ in (("grabbed", "REAL"), ("job", "INTEGER")):
+        if col not in have:
+            ex("ALTER TABLE wanted ADD COLUMN %s %s" % (col, typ))
+    ex("CREATE INDEX IF NOT EXISTS wanted_ep ON wanted(arr_ep)")
+    ex("CREATE INDEX IF NOT EXISTS wanted_arr ON wanted(kind, arr_id)")
     ex("CREATE INDEX IF NOT EXISTS wanted_work ON wanted(kind, work)")
     ex("CREATE INDEX IF NOT EXISTS arr_lib_tmdb ON arr_lib(kind, tmdb)")
+    ex("CREATE INDEX IF NOT EXISTS arr_lib_tvdb ON arr_lib(kind, tvdb)")
+    ex("CREATE INDEX IF NOT EXISTS jobs_xid ON jobs(xid)")  # "VODgrab downloaded this" on every browse card
+    ex("CREATE INDEX IF NOT EXISTS jobs_sab ON jobs(source, status, updated)")  # SAB queue and history polls
+    ex("CREATE INDEX IF NOT EXISTS movies_added ON movies(added)")  # Newznab RSS: newest movies
+    ex("CREATE INDEX IF NOT EXISTS series_modified ON series(modified)")  # Newznab RSS: newest series
     ex("CREATE INDEX IF NOT EXISTS arr_lib_norm ON arr_lib(kind, norm)")
     try:
         for t in ("tri_movies", "tri_series", "tri_works"):
@@ -1333,7 +1342,12 @@ def find_catalog(kind, titles, year, tmdb):
         if not toks:
             continue
         tok = max(toks, key=len)
-        for r in q("SELECT id, clean, year FROM %s WHERE norm LIKE ? AND %s" % (table, live()), "%" + tok + "%"):
+        if FTS and len(tok) >= 3:  # the trigram index finds the word without reading the whole catalog
+            sql, arg = ("SELECT id, clean, year FROM %s WHERE id IN (SELECT rowid FROM tri_%s WHERE tri_%s MATCH ?) "
+                        "AND %s" % (table, table, table, live()), '"%s"' % tok.replace('"', ""))
+        else:
+            sql, arg = "SELECT id, clean, year FROM %s WHERE norm LIKE ? AND %s" % (table, live()), "%" + tok + "%"
+        for r in q(sql, arg):
             cands[r["id"]] = r
     scored = []
     for r in cands.values():
@@ -1985,6 +1999,31 @@ def arr_work(kind, lib_row):
     return r["work"] if r else None
 
 
+def fetch_episode_lists(items):
+    """ensure_episodes for many series at once: [(series id, title for the log)]. Up to 3 requests at a time per
+    provider (within its connection limit), 8 in all."""
+    if not items:
+        return
+    gates = {}
+    for sid, _ in items:
+        pid = dec(sid)[0]
+        if pid not in gates:
+            p = PROVIDERS.get(pid) or {}
+            gates[pid] = threading.Semaphore(max(1, min(3, int(p.get("max_conn") or 1))))
+
+    def one(item):
+        sid, title = item
+        with gates[dec(sid)[0]]:
+            try:
+                ensure_episodes(sid)
+            except Exception as e:
+                if not isinstance(e, ProviderDown):
+                    log("Episode list for %s failed: %s" % (title, e), "warn")
+
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+        list(pool.map(one, items))
+
+
 def refresh_wanted():
     """Everything Sonarr and Radarr want (monitored, released or aired, no file) that a provider has."""
     if WANTED["running"]:
@@ -2013,6 +2052,7 @@ def refresh_wanted():
             for e in missing:
                 if e.get("monitored", True):
                     by_series[e.get("seriesId")].append(e)
+            todo = []  # [series id, library row, work, provider copies best first, wanted (season, episode)s, have]
             for sid, eps in by_series.items():
                 lib = q1("SELECT * FROM arr_lib WHERE kind='series' AND arr_id=?", sid)
                 if not lib:
@@ -2020,15 +2060,25 @@ def refresh_wanted():
                 work = arr_work("series", lib)
                 if not work:
                     continue
-                have = set()
-                for cp in q("SELECT id FROM series INDEXED BY series_work WHERE work=? AND %s" % live(), work):
-                    try:
-                        ensure_episodes(cp["id"])
-                    except Exception as e:
-                        if not isinstance(e, ProviderDown):
-                            log("Episode list for %s failed: %s" % (lib["title"], e), "warn")
-                    have.update((r["season"], r["episode"]) for r in
-                                q("SELECT season, episode FROM episodes WHERE series_id=?", cp["id"]))
+                copies = sorted([r["id"] for r in q("SELECT id FROM series INDEXED BY series_work WHERE work=? AND %s"
+                                                    % live(), work)], key=prio)
+                want = {(to_int(e.get("seasonNumber")), to_int(e.get("episodeNumber"))) for e in eps}
+                todo.append([sid, lib, work, copies, want, set()])
+            # Episode lists come from the provider (cached 12 hours). Fetch them several at a time, and only ask
+            # the next provider's copy for shows whose wanted episodes the better copies don't have.
+            rnd = 0
+            while True:
+                batch = [(t[3][rnd], t[1]["title"]) for t in todo if rnd < len(t[3]) and not t[4] <= t[5]]
+                if not batch:
+                    break
+                fetch_episode_lists(batch)
+                for t in todo:
+                    if rnd < len(t[3]):
+                        t[5].update((r["season"], r["episode"]) for r in
+                                    q("SELECT season, episode FROM episodes WHERE series_id=?", t[3][rnd]))
+                rnd += 1
+            for sid, lib, work, copies, want, have in todo:
+                eps = by_series[sid]
                 for e in eps:
                     se, ep = to_int(e.get("seasonNumber")), to_int(e.get("episodeNumber"))
                     rows.append(("series", sid, e.get("id"), work, se, ep, e.get("title") or "",
@@ -2041,10 +2091,11 @@ def refresh_wanted():
             for kind, aid, ep_id, work, se, ep, title, air, avail in rows:
                 prev = old.get((kind, aid, ep_id))
                 c.execute("INSERT INTO wanted(kind, arr_id, arr_ep, work, season, episode, title, air, available, "
-                          "found, searched, grabbed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                          "found, searched, grabbed, job) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           (kind, aid, ep_id, work, se, ep, title, air, avail,
                            prev["found"] if prev and prev["available"] == avail else now,
-                           prev["searched"] if prev else None, prev["grabbed"] if prev else None))
+                           prev["searched"] if prev else None, prev["grabbed"] if prev else None,
+                           prev["job"] if prev else None))
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
@@ -2113,11 +2164,11 @@ def wanted_grab(movie_ids, episode_ids):
         info = {"id": aid, "tmdbId": lib["tmdb"], "title": lib["title"] or w["title"], "year": lib["year"]} \
             if lib and lib["tmdb"] else None
         try:
-            enqueue_manual("movie", ids[0], arr_info=info)
+            jobs, _ = enqueue_manual("movie", ids[0], arr_info=info)
         except Exception as e:
             skip(w["title"], e)
             continue
-        ex("UPDATE wanted SET grabbed=? WHERE kind='movie' AND arr_id=?", now, aid)
+        ex("UPDATE wanted SET grabbed=?, job=? WHERE kind='movie' AND arr_id=?", now, jobs[0]["id"], aid)
         done["movies"] += 1
     by_series = collections.defaultdict(list)
     for ep_id in [int(x) for x in episode_ids or []]:
@@ -2149,11 +2200,11 @@ def wanted_grab(movie_ids, episode_ids):
                 skip(label, "no provider has it right now")
                 continue
             try:
-                enqueue_manual("episode", eid, arr_info=info)
+                jobs, _ = enqueue_manual("episode", eid, arr_info=info, arr_ep=w["arr_ep"])
             except Exception as e:
                 skip(label, e)
                 continue
-            ex("UPDATE wanted SET grabbed=? WHERE kind='series' AND arr_ep=?", now, w["arr_ep"])
+            ex("UPDATE wanted SET grabbed=?, job=? WHERE kind='series' AND arr_ep=?", now, jobs[0]["id"], w["arr_ep"])
             done["episodes"] += 1
     log("Queued %d movies and %d episodes from Wanted for download%s" % (
         done["movies"], done["episodes"], " (%d skipped)" % done["skipped"] if done["skipped"] else ""))
@@ -2173,19 +2224,21 @@ def wanted_view():
             rep_of[key] = card(r) if r else None
         return rep_of[key]
 
-    for r in q("SELECT * FROM wanted ORDER BY kind, title"):
+    for r in q("SELECT w.*, j.status AS jst, j.error AS jerr FROM wanted w LEFT JOIN jobs j ON j.id=w.job "
+               "ORDER BY w.kind, w.title"):
         c = rep(r["kind"], r["work"])
         if not c:
             continue
+        jb = {"status": r["jst"], "error": r["jerr"] or ""} if r["jst"] else None
         if r["kind"] == "movie":
             movies.append({"arr_id": r["arr_id"], "title": r["title"], "card": c, "searched": r["searched"],
-                           "found": r["found"], "grabbed": r["grabbed"]})
+                           "found": r["found"], "grabbed": r["grabbed"], "job": jb})
         else:
             sh = shows_ep.setdefault(r["arr_id"], {"arr_id": r["arr_id"], "card": c, "episodes": []})
             sh["episodes"].append({"arr_ep": r["arr_ep"], "season": r["season"], "episode": r["episode"],
                                    "title": r["title"], "air": r["air"], "available": bool(r["available"]),
                                    "searched": r["searched"], "found": r["found"],
-                                   "grabbed": r["grabbed"]})
+                                   "grabbed": r["grabbed"], "job": jb})
     shows = []
     for sh in shows_ep.values():
         sh["episodes"].sort(key=lambda e: (e["season"] or 0, e["episode"] or 0))
@@ -2218,6 +2271,27 @@ def movie_row(xid, fetch=True):
             if not isinstance(e, ProviderDown):
                 log("Movie info for %s failed: %s" % (pname(dec(xid)[0]), e), "warn")
     return q1("SELECT * FROM movies WHERE id=?", xid)
+
+
+def fetch_movie_info(ids):
+    """Load provider movie details (cached 7 days) for several copies at once, so a Radarr search with copies on
+    several providers waits for the slowest one instead of all of them in a row."""
+    stale = [i for i in dict.fromkeys(ids) if not ENGINE.is_down(dec(i)[0]) and
+             not q1("SELECT 1 FROM vodinfo WHERE id=? AND fetched>?", i, time.time() - 7 * 86400)]
+    if not stale:
+        return
+
+    def one(xid):
+        try:
+            vod_info(xid)
+        except Exception as e:
+            if not isinstance(e, ProviderDown):
+                log("Movie info for %s failed: %s" % (pname(dec(xid)[0]), e), "warn")
+
+    if len(stale) == 1:
+        return one(stale[0])
+    with ThreadPoolExecutor(max_workers=min(6, len(stale))) as pool:
+        list(pool.map(one, stale))
 
 
 PROBE_BG = collections.OrderedDict()
@@ -2791,8 +2865,9 @@ def add_many(items):
             "failed": sum(1 for r in out if not r["ok"])}
 
 
-def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None):
-    """arr_info: the Radarr movie or Sonarr series this is for, when already known (the Wanted page)."""
+def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None, arr_ep=None):
+    """arr_info: the Radarr movie or Sonarr series this is for, when already known (the Wanted page).
+    arr_ep: the Sonarr episode id, when known. The import then goes to exactly that movie or episode."""
     notes = []
     if kind == "movie":
         m = q1("SELECT * FROM movies WHERE id=?", xid)
@@ -2805,6 +2880,8 @@ def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None):
                 if info:
                     title, year = info.get("title") or title, info.get("year") or year
                     meta = {"tmdb": info.get("tmdbId"), "arr_title": title}
+                    if info.get("id"):
+                        meta["arr_movie"] = info["id"]
                     ex("INSERT OR REPLACE INTO matches(arr, arr_id, xids, method, score, title, year, checked) "
                        "VALUES('radarr', ?, ?, 'manual', 100, ?, ?, ?)", str(info.get("tmdbId")),
                        json.dumps([xid]), title, year, time.time())
@@ -2840,6 +2917,8 @@ def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None):
                 if info:
                     title = info.get("title") or title
                     meta = {"tvdb": info.get("tvdbId"), "arr_title": title}
+                    if info.get("id"):
+                        meta["arr_series"] = info["id"]
                     ex("INSERT OR REPLACE INTO matches(arr, arr_id, xids, method, score, title, year, checked) "
                        "VALUES('sonarr', ?, ?, 'manual', 100, ?, ?, ?)", str(info.get("tvdbId")),
                        json.dumps([sid]), title, info.get("year"), time.time())
@@ -2850,6 +2929,8 @@ def enqueue_manual(kind, xid, season=None, force=False, dp=None, arr_info=None):
         jobs = []
         for e in eps:
             md = dict(meta, season=e["season"], ep=e["episode"])
+            if arr_ep and len(eps) == 1:
+                md["arr_ep"] = int(arr_ep)
             jobs.append(new_job("manual", "sonarr", "episode", e["id"], e["ext"],
                                 episode_release(title, e["season"], e["episode"], srow["name"], e),
                                 ep_label(title, e), md, force,
@@ -2879,6 +2960,10 @@ class Unreachable(Transient):
 
 class ProviderDown(RuntimeError):
     """The provider is marked down; skipped without contacting it."""
+
+
+class ImportRefused(Exception):
+    """VODgrab will not hand the file to Radarr or Sonarr (the movie or episode already has a file)."""
 
 
 class Limited(Exception):
@@ -3365,7 +3450,12 @@ class Engine:
             return
         name = "DownloadedMoviesScan" if j["kind"] == "movie" else "DownloadedEpisodesScan"
         try:
-            cmd = arr.post("/api/v3/command", {"name": name, "path": path, "importMode": "Move"}) or {}
+            target = self.import_target(arr, j)
+            body = self.exact_import(arr, path, target) if target else None
+            if body:
+                cmd = arr.post("/api/v3/command", {"name": "ManualImport", "importMode": "Move", "files": [body]}) or {}
+            else:  # the arr works out the title from the file name
+                cmd = arr.post("/api/v3/command", {"name": name, "path": path, "importMode": "Move"}) or {}
             cid, c = cmd.get("id"), cmd
             deadline = time.time() + 900
             while cid and time.time() < deadline:
@@ -3376,12 +3466,92 @@ class Engine:
             if not os.path.exists(path):
                 upd(jid, status="imported", error="")
                 log("Imported %s into %s" % (j["release"], arr.label))
+                if target:  # no longer wanted: drop it from the Wanted page now, not at the next refresh
+                    if j["kind"] == "movie":
+                        ex("DELETE FROM wanted WHERE kind='movie' AND arr_id=?", target["movie"])
+                    else:
+                        ex("DELETE FROM wanted WHERE kind='series' AND arr_ep=?", target["episode"])
                 return
-            reason = self.rejections(arr, path) or c.get("message") or "%s did not import the file" % arr.label
+            reason = (self.rejections(arr, path) if not body else "") or c.get("message") or \
+                "%s did not import the file" % arr.label
             upd(jid, status="import_failed", error=reason)
             log("Import failed for %s: %s" % (j["release"], reason), "warn")
+        except ImportRefused as e:
+            upd(jid, status="import_failed", error=str(e))
+            log("Import failed for %s: %s" % (j["release"], e), "warn")
         except ArrError as e:
             upd(jid, status="import_failed", error=str(e))
+
+    def import_target(self, arr, j):
+        """The exact Radarr movie or Sonarr episode this download is for, as IDs, or None when unknown.
+        When it already has a file, "have" holds that file's quality, so only an upgrade is imported."""
+        meta = jmeta(j)
+        if j["kind"] == "movie":
+            mid = meta.get("arr_movie")
+            if not mid and meta.get("tmdb"):
+                mid = (radarr_movie(tmdb=meta["tmdb"], fresh=True) or {}).get("id")
+            if not mid:
+                return None
+            mv = arr.get("/api/v3/movie/%s" % mid) or {}
+            if not mv.get("id"):
+                return None
+            out = {"movie": mv["id"], "what": mv.get("title") or "this movie"}
+            if mv.get("hasFile"):
+                out["have"] = ((mv.get("movieFile") or {}).get("quality") or {}).get("quality") or {}
+            return out
+        sid = meta.get("arr_series")
+        if not sid and meta.get("tvdb"):
+            sid = (sonarr_series_by_tvdb(meta["tvdb"], fresh=True) or {}).get("id")
+        if not sid or meta.get("season") is None:
+            return None
+        ep = None
+        if meta.get("arr_ep"):
+            try:
+                ep = arr.get("/api/v3/episode/%s" % meta["arr_ep"])
+            except ArrError:
+                ep = None
+        if not ep:
+            ep = next((e for e in arr.get("/api/v3/episode", seriesId=sid) or []
+                       if e.get("seasonNumber") == meta["season"] and e.get("episodeNumber") == meta.get("ep")), None)
+        if not ep or not ep.get("id"):
+            return None
+        out = {"series": ep.get("seriesId") or sid, "episode": ep["id"],
+               "what": "S%02dE%02d" % (meta["season"], meta.get("ep") or 0)}
+        if ep.get("hasFile"):
+            out["have"] = {}
+            if ep.get("episodeFileId"):
+                try:
+                    f = arr.get("/api/v3/episodefile/%s" % ep["episodeFileId"]) or {}
+                    out["have"] = (f.get("quality") or {}).get("quality") or {}
+                except ArrError:
+                    pass
+        return out
+
+    def exact_import(self, arr, path, target):
+        """ManualImport entry that names the movie or episode, so the arr doesn't guess from the file name
+        (scene numbering on TheXEM, several series with the same title)."""
+        params = {"folder": os.path.dirname(path), "filterExistingFiles": "false"}
+        if "movie" in target:
+            params["movieId"] = target["movie"]
+        else:
+            params["seriesId"] = target["series"]
+        items = arr.get("/api/v3/manualimport", **params) or []
+        it = next((x for x in items if os.path.basename(x.get("path") or "") == os.path.basename(path)), None)
+        if not it or not it.get("quality"):
+            return None
+        if "have" in target:  # already has a file: only a higher resolution replaces it
+            new = (it["quality"].get("quality") or {})
+            if (new.get("resolution") or 0) <= (target["have"].get("resolution") or 0):
+                raise ImportRefused("%s already has %s%s, and this file (%s) is not an upgrade; left it in place" % (
+                    arr.label, target["what"], " (%s)" % target["have"]["name"] if target["have"].get("name") else "",
+                    new.get("name") or "unknown quality"))
+        body = {k: it[k] for k in ("path", "folderName", "releaseGroup", "quality", "languages", "language",
+                                    "indexerFlags", "releaseType") if it.get(k) is not None}
+        if "movie" in target:
+            body["movieId"] = target["movie"]
+        else:
+            body.update(seriesId=target["series"], episodeIds=[target["episode"]])
+        return body
 
     def rejections(self, arr, path):
         try:
@@ -3621,9 +3791,10 @@ def grouped_movies(ids, title_fn, check=True):
         groups.append(same)
     if check:
         ensure_probed([("movie", i) for g in groups for i in g])
+    fetch_movie_info([i for g in groups for i in g])
     items = []
     for same in groups:
-        rows = [r for r in (movie_row(i) for i in same) if r]
+        rows = [r for r in (movie_row(i, fetch=False) for i in same) if r]
         if not rows:
             continue
         title, year, tmdb, imdb = title_fn(rows[0])
@@ -4724,10 +4895,10 @@ def meta_pass():
     with ThreadPoolExecutor(max_workers=max(2, min(8, rate // 2))) as pool:
         for _ in pool.map(one, todo):
             if time.time() - last_apply > 30:
-                apply_meta()
+                apply_meta_soon()
                 _facet_cache.clear()
                 last_apply = time.time()
-    apply_meta()
+    apply_meta_soon()
     _facet_cache.clear()
     META["rate_seen"] = n[0] / max(0.1, time.time() - t0)
     return not META["auth_bad"]
@@ -5192,12 +5363,20 @@ def lib_sql(kind, a="t", tcol=None):
     tc = tcol or "%s.tmdb" % a
     arr, table = ("radarr", "movies") if kind == "movie" else ("sonarr", "series")
     # Linked by TMDB ID or title and year, unless you said it is not this title; or linked by hand
-    key = "CAST(l.%s AS TEXT)" % ("tmdb" if kind == "movie" else "tvdb")  # how Radarr/Sonarr searches name it
-    m = ("SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND ((((%s IS NOT NULL AND l.tmdb=%s) OR "
-         "(l.norm=%s.norm AND (%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1))) AND NOT EXISTS "
-         "(SELECT 1 FROM unlinks u WHERE u.arr='%s' AND u.arr_id=%s AND u.work=%s.work)) OR %s IN "
-         "(SELECT o.arr_id FROM overrides o JOIN %s x ON x.id=o.xid WHERE o.arr='%s' AND x.work=%s.work))"
-         % (k, tc, tc, a, a, a, arr, key, a, key, table, arr, a))
+    col = "tmdb" if kind == "movie" else "tvdb"  # how Radarr/Sonarr searches name it
+    key = "CAST(l.%s AS TEXT)" % col
+
+    def m_sql(extra):
+        # Three separate lookups (by TMDB ID, by title and year, linked by hand) so each one uses an index;
+        # one query with OR between them read the whole Radarr/Sonarr library for every card.
+        unl = ("NOT EXISTS (SELECT 1 FROM unlinks u WHERE u.arr='%s' AND u.arr_id=%s AND u.work=%s.work)"
+               % (arr, key, a))
+        return ("SELECT 1 WHERE EXISTS(SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND %s IS NOT NULL AND l.tmdb=%s "
+                "AND %s%s) OR EXISTS(SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND l.norm=%s.norm AND "
+                "(%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1) AND %s%s) OR "
+                "EXISTS(SELECT 1 FROM overrides o JOIN %s x ON x.id=o.xid JOIN arr_lib l ON l.kind='%s' AND "
+                "l.%s=CAST(o.arr_id AS INTEGER) WHERE o.arr='%s' AND x.work=%s.work%s)"
+                % (k, tc, tc, unl, extra, k, a, a, a, unl, extra, table, k, col, arr, a, extra))
     if kind == "movie":
         vg = ("SELECT 1 FROM jobs j WHERE j.kind='movie' AND j.status IN ('imported','completed') AND j.xid IN "
               "(SELECT id FROM movies x INDEXED BY movies_work WHERE x.work=%s.work)" % a)
@@ -5205,7 +5384,7 @@ def lib_sql(kind, a="t", tcol=None):
         vg = ("SELECT 1 FROM jobs j JOIN episodes e ON e.id=j.xid WHERE j.kind='episode' AND "
               "j.status IN ('imported','completed') AND e.series_id IN (SELECT id FROM series x INDEXED BY "
               "series_work WHERE x.work=%s.work)" % a)
-    return m, m + " AND l.has_file=1", vg
+    return m_sql(""), m_sql(" AND l.has_file=1"), vg
 
 
 QRANK = "CASE %s WHEN '2160p' THEN 0 WHEN '1080p' THEN 1 WHEN '720p' THEN 2 WHEN '480p' THEN 3 ELSE 9 END"
@@ -5264,6 +5443,16 @@ def apply_meta(c=None, kind=None, tmdb=None):
         watch=m.watch, olang=m.olang, poster=m.poster, genres=COALESCE(works.pgenres, '') || COALESCE(m.genres, ''),
         rating_n=CASE WHEN m.votes>=25 AND m.rating>0 THEN m.rating ELSE works.prating END
         FROM md.meta m WHERE m.kind=works.kind AND m.tmdb=works.mt AND m.data IS NOT NULL%s""" % one, args)
+
+
+def apply_meta_soon():
+    """apply_meta for the background fill. While a catalog sync holds the database it is skipped; the next pass,
+    or the sync itself, applies it."""
+    try:
+        apply_meta()
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            raise
 
 
 def update_work_quality(cid):
@@ -5895,11 +6084,18 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(body, default=str).encode()
         elif isinstance(body, str):
             body = body.encode()
+        headers = dict(headers or {})
+        if len(body) > 1024 and not ctype.startswith("image/") and "Content-Encoding" not in headers and \
+                "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body = UI_GZ if body is UI_BYTES else gzip.compress(body, 5)  # JSON and XML shrink 5 to 10 times
+            headers["Content-Encoding"] = "gzip"
+            headers["Vary"] = "Accept-Encoding"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (headers or {}).items():
+        if "Cache-Control" not in headers:
+            self.send_header("Cache-Control", "no-store")
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -5951,10 +6147,16 @@ class Handler(BaseHTTPRequestHandler):
             if not self.ui_auth():
                 return
             if path in ("/", "/index.html"):
-                return self.send(200, UI_HTML, "text/html; charset=utf-8")
+                # The page only changes with the version: the browser keeps it and just checks it is current
+                hdr = {"ETag": UI_ETAG, "Cache-Control": "no-cache"}
+                if self.headers.get("If-None-Match") == UI_ETAG:
+                    return self.send(304, b"", "text/html; charset=utf-8", hdr)
+                return self.send(200, UI_BYTES, "text/html; charset=utf-8", hdr)
             if path.startswith("/api/"):
                 return self.api(method, path[5:], qs)
             self.send(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            return  # the browser or arr left before the answer was sent
         except ArrError as e:
             self.send(502, {"error": mask(str(e))})
         except (ValueError, RuntimeError) as e:
@@ -7234,7 +7436,8 @@ async function refreshStatus(){try{status=await api("status")}catch(e){return}
   const nq=$("#nQ");nq.hidden=!status.counts.active;nq.textContent=status.counts.active;
   const nw=$("#nW");nw.hidden=!status.counts.wanted;nw.textContent=status.counts.wanted}
 $("#pauseBtn").onclick=async()=>{await api("pause",{paused:!(status.paused||status.prov_error)});refreshStatus();if(tab=="queue")renderQueue()};
-setInterval(refreshStatus,8000);
+setInterval(()=>{if(!document.hidden)refreshStatus()},8000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)refreshStatus()});
 
 /* ---------------- browse */
 const LIBL={missing:"Not in library",in_arr:"In library, no file",has_file:"In library with file",vodgrab:"Downloaded by VODgrab",wanted:"Wanted by Sonarr or Radarr"};
@@ -7613,7 +7816,7 @@ async function renderQueue(){
         <div class="acts">${["queued","retry_wait"].includes(j.status)?`<button class="btn s" data-a="now" data-id="${j.id}">Download now</button><button class="btn s" data-a="up" data-id="${j.id}">↑</button><button class="btn s" data-a="down" data-id="${j.id}">↓</button>`:""}
         ${j.status!="importing"?`<button class="btn s d" data-a="cancel" data-id="${j.id}">Cancel</button>`:""}</div></div>`}).join("")}</div>`:`<div class="empty">Nothing queued.</div>`);
     $$("[data-a]",m).forEach(b=>b.onclick=async()=>{try{await api(`job/${b.dataset.id}/${b.dataset.a}`,{});draw()}catch(e){toast(e.message,1)}})};
-  await draw();timer=setInterval(draw,2000)}
+  await draw();timer=setInterval(()=>{if(!document.hidden)draw()},2000)}
 
 /* ---------------- wanted */
 const sk=t=>String(t||"").normalize("NFKD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/&/g," and ").replace(/[^a-z0-9]+/g," ").trim().replace(/^(the|a|an) /,"");
@@ -7670,17 +7873,18 @@ function wDraw(){const box=$("#wlist");if(!box)return;wWriteHash();
   btn.onclick=e=>{if(confirm(`Ask ${ids.m.length?`Radarr to search ${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`Sonarr to search ${ids.e.length} episode${ids.e.length==1?"":"s"}`:""}?`))wGo(ids.m,ids.e,e.target)};
   const gb=$("#wGrab");gb.disabled=!n;gb.textContent=n?`Download these ${n} manually`:"Nothing to download";
   gb.onclick=e=>{if(confirm(`Download ${ids.m.length?`${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`${ids.e.length} episode${ids.e.length==1?"":"s"}`:""} with VODgrab now, without a Radarr or Sonarr search? They are imported when done.`))wGrab(ids.m,ids.e,e.target)};
-  const srch=(t,g)=>(t?`<span class="muted" style="font-size:12px">searched ${ago(t)}</span>`:"")+(g?`<span class="muted" style="font-size:12px">${t?" · ":""}queued in VODgrab ${ago(g)}</span>`:"");
+  const jst=(g,j)=>!g?"":!j?`queued in VODgrab ${ago(g)}`:["failed","import_failed"].includes(j.status)?`<a href="#history" onclick="go('history');return false" style="color:var(--bad)">${j.status=="failed"?"Download failed":"Import failed"}${j.error?": "+esc(j.error):""}</a>`:j.status=="cancelled"?"download cancelled":["downloading","verifying","importing"].includes(j.status)?`${STL[j.status].toLowerCase()} in VODgrab`:`${(STL[j.status]||j.status).toLowerCase()} in VODgrab ${ago(g)}`;
+  const srch=(t,g,j)=>(t?`<span class="muted" style="font-size:12px">searched ${ago(t)}</span>`:"")+(g?`<span class="muted" style="font-size:12px">${t?" · ":""}${jst(g,j)}</span>`:"");
   const nE=ids.e.length;
   box.innerHTML=(movies.length?`<h3 class="wh">Movies <span class="muted">${movies.length}</span></h3><div class="list">${movies.map(x=>`<div class="row" data-l="${skl(x.card.clean)}"><div class="main"><div class="title">${esc(x.card.clean)} ${x.card.year?`<span class="muted">(${x.card.year})</span>`:""}</div>
-      <div class="sub">${x.card.quality?`<span class="q k${x.card.quality}">${x.card.quality=="2160p"?"4K":x.card.quality}</span> `:""}${esc(x.card.providers.join(", "))} ${srch(x.searched,x.grabbed)}</div></div>
+      <div class="sub">${x.card.quality?`<span class="q k${x.card.quality}">${x.card.quality=="2160p"?"4K":x.card.quality}</span> `:""}${esc(x.card.providers.join(", "))} ${srch(x.searched,x.grabbed,x.job)}</div></div>
       <div class="acts"><button class="btn s" data-open-m="${x.card.id}">Details</button><button class="btn s p" data-sm="${x.arr_id}">Search in Radarr</button><button class="btn s" data-gm="${x.arr_id}">Download manually</button></div></div>`).join("")}</div>`:"")+
     (shows.length?`<h3 class="wh">Episodes <span class="muted">${nE} in ${shows.length} show${shows.length==1?"":"s"}</span></h3><div class="list">${shows.map((s,i)=>{const av=s.shown.filter(e=>e.available).length;return `<div class="row" style="display:block" data-l="${skl(s.card.clean)}">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><div class="main"><div class="title">${esc(s.card.clean)} ${s.card.year?`<span class="muted">(${s.card.year})</span>`:""}</div>
       <div class="sub">${s.available} of ${s.missing} missing episode${s.missing==1?"":"s"} available · ${esc(s.card.providers.join(", "))}</div></div>
       <div class="acts"><button class="btn s" data-exp="${i}">Episodes</button><button class="btn s" data-open-s="${s.card.id}">Details</button><button class="btn s p" data-ss="${i}">Search ${av} in Sonarr</button><button class="btn s" data-gs="${i}">Download ${av} manually</button></div></div>
       <div class="eps" data-eps="${i}" ${WF.q||shows.length==1?"":"hidden"}>${s.shown.map(e=>`<div class="ep${e.available?"":" na"}"><span class="n">S${String(e.season).padStart(2,"0")}E${String(e.episode).padStart(2,"0")}</span><span class="et">${esc(e.title)}${e.air?` <span class="muted" style="font-size:12px">· ${new Date(e.air).toLocaleDateString()}</span>`:""}</span>
-        ${e.available?`${srch(e.searched,e.grabbed)}<button class="btn s" data-se="${e.arr_ep}">Search</button><button class="btn s" data-ge="${e.arr_ep}">Download</button>`:`<span class="muted" style="font-size:12px">Not on any provider</span>`}</div>`).join("")}</div></div>`}).join("")}</div>`:"")+
+        ${e.available?`${srch(e.searched,e.grabbed,e.job)}<button class="btn s" data-se="${e.arr_ep}">Search</button><button class="btn s" data-ge="${e.arr_ep}">Download</button>`:`<span class="muted" style="font-size:12px">Not on any provider</span>`}</div>`).join("")}</div></div>`}).join("")}</div>`:"")+
     ((W.sonarr||W.radarr)&&!movies.length&&!shows.length?`<div class="empty">${!W.at?"Press Refresh to check.":W.movies.length+W.shows.length?"Nothing matches these filters.":"Nothing Sonarr or Radarr wants is on your providers right now."}</div>`:"");
   $$("[data-sm]",box).forEach(b=>b.onclick=()=>wGo([+b.dataset.sm],[],b));
   $$("[data-ss]",box).forEach(b=>b.onclick=()=>wGo([],shows[+b.dataset.ss].shown.filter(e=>e.available).map(e=>e.arr_ep),b));
@@ -7981,7 +8185,7 @@ function runSum(x){return x.added_movies==null?`${x.movies} movies, ${x.series} 
     try{const r=await fetch("/api/backup/upload?filename="+encodeURIComponent(f.name),{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:f});
       const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);$("#o_bk").style.display="none";restorePick(j.parts,{token:j.token},j.name)}
     catch(x){out("bk",x.message)}e.target.value=""};
-  drawMeta();timer=setInterval(()=>{if(tab=="settings")drawMeta()},4000)}
+  drawMeta();timer=setInterval(()=>{if(tab=="settings"&&!document.hidden)drawMeta()},4000)}
 async function drawMeta(){let r;try{r=await api("meta")}catch(e){return}const box=$("#mstat");if(!box)return;const c=r.counts;
   const pct=c.with_id?Math.round(c.have*100/c.with_id):0;
   let head;
@@ -8017,6 +8221,9 @@ refreshStatus().then(()=>route());
 </body>
 </html>
 """
+UI_BYTES = UI_HTML.encode()
+UI_GZ = gzip.compress(UI_BYTES, 9)
+UI_ETAG = '"%s-%08x"' % (VERSION, zlib.crc32(UI_BYTES))
 
 if __name__ == "__main__":
     main()
