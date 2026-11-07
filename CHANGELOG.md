@@ -2,6 +2,13 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.2 (2026-11-07)
+
+- **Fix a show linked to the wrong Sonarr series.** A show's details now have the **Linked in Sonarr** section that movies already had: **Not this show** unlinks it, and **Link to a different show** picks the right one from your Sonarr library. Unlinking also cancels manual downloads that were still waiting or downloading for the wrong show.
+- **Wrong-show episodes are not imported.** Since 1.16.0 VODgrab tells Sonarr exactly which episode a file is for, so a wrong link would put the wrong show's file in. Now an episode whose length is far off from the show's usual episode length in Sonarr (less than half, or more than double) is refused with the reason. This catches cases like a 55-minute drama and a 23-minute cartoon with the same name.
+- **Better automatic matching:** two titles with the same name and year are no longer treated as the same title when both have a TMDB ID and the IDs differ.
+- If **Retry import** in 1.16.0 or 1.16.1 put another show's episodes into a Sonarr show (for example Bordertown), delete those files in Sonarr.
+
 ## 1.16.1 (2026-11-07)
 
 - **Open in Radarr / Open in Sonarr** buttons: in a movie's or show's details (also next to each title under **Linked in Radarr**), on Wanted rows, and in History, so you can jump straight to the item Radarr or Sonarr is looking at, for example to see why an import was refused.

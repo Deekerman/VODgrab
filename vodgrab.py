@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.1"
+VERSION = "1.16.2"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -1346,16 +1346,27 @@ def find_catalog(kind, titles, year, tmdb):
             continue
         tok = max(toks, key=len)
         if FTS and len(tok) >= 3:  # the trigram index finds the word without reading the whole catalog
-            sql, arg = ("SELECT id, clean, year FROM %s WHERE id IN (SELECT rowid FROM tri_%s WHERE tri_%s MATCH ?) "
-                        "AND %s" % (table, table, table, live()), '"%s"' % tok.replace('"', ""))
+            sql, arg = ("SELECT id, clean, year, tmdb, work FROM %s WHERE id IN (SELECT rowid FROM tri_%s WHERE tri_%s "
+                        "MATCH ?) AND %s" % (table, table, table, live()), '"%s"' % tok.replace('"', ""))
         else:
-            sql, arg = "SELECT id, clean, year FROM %s WHERE norm LIKE ? AND %s" % (table, live()), "%" + tok + "%"
+            sql, arg = ("SELECT id, clean, year, tmdb, work FROM %s WHERE norm LIKE ? AND %s" % (table, live()),
+                        "%" + tok + "%")
         for r in q(sql, arg):
             cands[r["id"]] = r
     scored = []
+    mts = {}
     for r in cands.values():
         if year and r["year"] and abs(int(year) - int(r["year"])) > 1:
             continue
+        if tmdb:  # a copy known to be a different title (another TMDB ID) is not this one, however close the name
+            ct = r["tmdb"]
+            if not ct and r["work"]:
+                if r["work"] not in mts:
+                    w = q1("SELECT mt FROM works WHERE kind=? AND work=?", kind, r["work"])
+                    mts[r["work"]] = w["mt"] if w else None
+                ct = mts[r["work"]]
+            if ct and int(ct) != int(tmdb):
+                continue
         sc = max(score(t, r["clean"]) for t in titles)
         if sc >= S()["min_score"]:
             scored.append((sc, r["id"]))
@@ -1372,7 +1383,8 @@ def equivalents(kind, cid):
     if not r:
         return []
     rows = q("SELECT id FROM %s WHERE %s AND ((tmdb IS NOT NULL AND tmdb=?) OR (norm=? AND (year IS NULL OR ? IS NULL "
-             "OR ABS(year-?)<=1)))" % (table, live()), r["tmdb"], r["norm"], r["year"], r["year"])
+             "OR ABS(year-?)<=1) AND (tmdb IS NULL OR ? IS NULL OR tmdb=?)))" % (table, live()),
+             r["tmdb"], r["norm"], r["year"], r["year"], r["tmdb"], r["tmdb"])
     ids = {x["id"] for x in rows} | {cid}
     return sorted(ids, key=prio)
 
@@ -1455,8 +1467,9 @@ def arr_links(kind, xid):
         seen.add(r["arr_id"])
         out.append((r, "manual"))
     for r in q("SELECT * FROM arr_lib l WHERE l.kind=? AND ((? IS NOT NULL AND l.tmdb=?) OR (l.norm=? AND (? IS NULL OR "
-               "l.year IS NULL OR ABS(l.year-?)<=1))) AND NOT EXISTS (SELECT 1 FROM unlinks u WHERE u.arr=? AND "
-               "u.arr_id=%s AND u.work=?)" % key, kind, mt, mt, nrm, yr, yr, arr, row["work"]):
+               "l.year IS NULL OR ABS(l.year-?)<=1) AND (? IS NULL OR l.tmdb IS NULL OR l.tmdb=?))) AND NOT EXISTS "
+               "(SELECT 1 FROM unlinks u WHERE u.arr=? AND u.arr_id=%s AND u.work=?)" % key,
+               kind, mt, mt, nrm, yr, yr, mt, mt, arr, row["work"]):
         if r["arr_id"] not in seen:
             seen.add(r["arr_id"])
             out.append((r, "tmdb" if mt and r["tmdb"] == mt else "title"))
@@ -1477,6 +1490,7 @@ def link_change(data):
     olds = [to_int(x) for x in (olds if isinstance(olds, list) else [olds]) if to_int(x)]
     new = to_int(data.get("link"))
     name = "%s (%s)" % (row["clean"], row["year"] or "?")
+    cancelled = 0
     for old in olds:
         if old == new:
             continue
@@ -1489,6 +1503,7 @@ def link_change(data):
            arr, key, row["work"])
         ex("DELETE FROM matches WHERE arr=? AND arr_id=?", arr, key)
         log("%s is not %s's %s (%s)" % (name, arr.title(), was["title"], was["year"]))
+        cancelled += cancel_wrong_downloads(kind, row["work"], was)
     if new:
         lib = q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, new)
         key = link_key(lib)
@@ -1503,7 +1518,29 @@ def link_change(data):
         log("%s is now linked to %s's %s (%s)" % (name, arr.title(), lib["title"], lib["year"]))
     _facet_cache.clear()
     threading.Thread(target=refresh_wanted, daemon=True).start()
-    return {"links": arr_links(kind, row["id"])}
+    return {"links": arr_links(kind, row["id"]), "cancelled": cancelled}
+
+
+def cancel_wrong_downloads(kind, work, was):
+    """Manual downloads of this title that were meant for the Radarr movie or Sonarr series you just unlinked:
+    cancel the ones not finished yet, so the wrong title isn't imported. Returns how many."""
+    if kind == "movie":
+        xids = "SELECT id FROM movies INDEXED BY movies_work WHERE work=?"
+        own, idk, idv = "arr_movie", "tmdb", was["tmdb"]
+    else:
+        xids = "SELECT e.id FROM episodes e JOIN series x INDEXED BY series_work ON x.id=e.series_id WHERE x.work=?"
+        own, idk, idv = "arr_series", "tvdb", was["tvdb"]
+    n = 0
+    for j in q("SELECT * FROM jobs WHERE source='manual' AND kind=? AND status IN ('queued','retry_wait','downloading',"
+               "'verifying') AND xid IN (%s)" % xids, "movie" if kind == "movie" else "episode", work):
+        meta = jmeta(j)
+        if meta.get(own) == was["arr_id"] or (idv and str(meta.get(idk)) == str(idv)):
+            job_action(j["id"], "cancel")
+            n += 1
+    if n:
+        log("Cancelled %d download%s meant for %s's %s" % (n, "" if n == 1 else "s",
+                                                           "Radarr" if kind == "movie" else "Sonarr", was["title"]))
+    return n
 
 
 def arr_lib_search(kind, text):
@@ -2037,8 +2074,10 @@ def arr_work(kind, lib_row):
     r = q1("SELECT work FROM works WHERE kind=? AND mt IS NOT NULL AND mt=?%s LIMIT 1" % adult, kind,
            lib_row["tmdb"]) if lib_row["tmdb"] else None
     if not r and lib_row["norm"]:
-        r = q1("SELECT work FROM works WHERE kind=? AND norm=? AND (year IS NULL OR ? IS NULL OR ABS(year-?)<=1)%s "
-               "LIMIT 1" % adult, kind, lib_row["norm"], lib_row["year"], lib_row["year"])
+        # Same title and year, unless both have a TMDB ID and they differ (two shows called Bordertown in 2016)
+        r = q1("SELECT work FROM works WHERE kind=? AND norm=? AND (year IS NULL OR ? IS NULL OR ABS(year-?)<=1) "
+               "AND (mt IS NULL OR ? IS NULL OR mt=?)%s LIMIT 1" % adult, kind, lib_row["norm"], lib_row["year"],
+               lib_row["year"], lib_row["tmdb"], lib_row["tmdb"])
     return r["work"] if r else None
 
 
@@ -3564,6 +3603,20 @@ class Engine:
             return None
         out = {"series": ep.get("seriesId") or sid, "episode": ep["id"],
                "what": "S%02dE%02d" % (meta["season"], meta.get("ep") or 0)}
+        # A file far shorter or longer than the show's episodes is most likely another show with the same name,
+        # linked by mistake; importing it by ID would put it in the wrong show.
+        mm = re.search(r"(\d+) min", str(meta.get("probe") or ""))
+        if mm:
+            try:
+                ser = arr.get("/api/v3/series/%s" % out["series"]) or {}
+            except ArrError:
+                ser = {}
+            run, got = to_int(ser.get("runtime")) or 0, int(mm.group(1))
+            if run >= 5 and got and (got < run * 0.5 or got > run * 2.2):
+                raise ImportRefused(
+                    "This file is %d min but Sonarr's %s runs about %d min an episode, so it is probably a different "
+                    "show with the same name. Check the link in the show's details (Not this show)." % (
+                        got, ser.get("title") or "show", run))
         if ep.get("hasFile"):
             out["have"] = {}
             if ep.get("episodeFileId"):
@@ -5420,10 +5473,11 @@ def lib_sql(kind, a="t", tcol=None):
                % (arr, key, a))
         return ("SELECT 1 WHERE EXISTS(SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND %s IS NOT NULL AND l.tmdb=%s "
                 "AND %s%s) OR EXISTS(SELECT 1 FROM arr_lib l WHERE l.kind='%s' AND l.norm=%s.norm AND "
-                "(%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1) AND %s%s) OR "
+                "(%s.year IS NULL OR l.year IS NULL OR ABS(l.year-%s.year)<=1) AND (%s IS NULL OR l.tmdb IS NULL OR "
+                "l.tmdb=%s) AND %s%s) OR "
                 "EXISTS(SELECT 1 FROM overrides o JOIN %s x ON x.id=o.xid JOIN arr_lib l ON l.kind='%s' AND "
                 "l.%s=CAST(o.arr_id AS INTEGER) WHERE o.arr='%s' AND x.work=%s.work%s)"
-                % (k, tc, tc, unl, extra, k, a, a, a, unl, extra, table, k, col, arr, a, extra))
+                % (k, tc, tc, unl, extra, k, a, a, a, tc, tc, unl, extra, table, k, col, arr, a, extra))
     # From the title's copies to their jobs by job xid; going through the job status index instead read every
     # finished download for every card.
     if kind == "movie":
@@ -6033,12 +6087,13 @@ def series_detail(sid):
     for e in q("SELECT * FROM episodes WHERE series_id=? ORDER BY season, episode", sid):
         seasons.setdefault(e["season"], []).append(dict(e, job=jobs.get(e["id"]), media=media_view(e)))
     out["seasons"] = [{"season": k, "episodes": v} for k, v in seasons.items()]
-    lib = q1("SELECT * FROM arr_lib WHERE kind='series' AND ((? IS NOT NULL AND tmdb=?) OR (norm=? AND (year IS NULL "
-             "OR ? IS NULL OR ABS(year-?)<=1))) LIMIT 1", srow["tmdb"], srow["tmdb"], srow["norm"], srow["year"],
-             srow["year"])
-    out["tvdb"] = lib["tvdb"] if lib else None
-    out["in_sonarr"] = bool(lib)
-    out["arr_url"] = arr_page("series", lib)
+    # The same links the Linked in Sonarr section shows, so "Not this show" and manual links apply here too
+    out["links"] = arr_links("series", sid)
+    out["arr_ok"] = SONARR.ok()
+    first = out["links"][0] if out["links"] else None
+    out["tvdb"] = first["tvdb"] if first else None
+    out["in_sonarr"] = bool(first)
+    out["arr_url"] = first["url"] if first else None
     wanted = {(w["season"], w["episode"]): w["arr_ep"] for w in
               q("SELECT season, episode, arr_ep FROM wanted WHERE kind='series' AND work=?", srow["work"])}
     for se in out["seasons"]:
@@ -7773,7 +7828,7 @@ function wireDetail(kind,m){const sh=$("#sheet");
   $$("[data-open]",sh).forEach(b=>b.onclick=()=>{const [k,i]=b.dataset.open.split(":");k=="movie"?openMovie(+i):openSeries(+i)});
   const t=$("#trl");if(t)t.onclick=()=>{const v=m.videos[0];const box=$("#trbox");box.innerHTML=box.innerHTML?"":`<div class="trailer"><iframe src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(v.k)}?autoplay=1&rel=0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>`;if(box.innerHTML)box.scrollIntoView({behavior:"smooth",block:"nearest"})}}
 function drawLinks(kind,id,links){const box=$("#linkSec");if(!box)return;
-  const A=kind=="movie"?"Radarr":"Sonarr",w=kind=="movie"?"movie":"series";
+  const A=kind=="movie"?"Radarr":"Sonarr",w=kind=="movie"?"movie":"show";
   const how={tmdb:"matched by TMDB ID",title:"matched by title and year",manual:"linked by you"};
   const ids=l=>[l.imdb,l.tmdb?"TMDB "+l.tmdb:"",l.tvdb?"TVDB "+l.tvdb:""].filter(Boolean).join(" · ");
   box.innerHTML=`<h4>Linked in ${A}</h4>${links.length?links.map(l=>`<div class="src"><span class="pn">${esc(l.title)}${l.year?` (${l.year})`:""}</span>
@@ -7782,14 +7837,14 @@ function drawLinks(kind,id,links){const box=$("#linkSec");if(!box)return;
     <div class="tools" style="margin:8px 0 0"><button class="btn s" id="lnkChg">Link to a different ${w}…</button></div><div id="lnkPick"></div>`;
   $$("[data-un]",box).forEach(b=>b.onclick=async()=>{const l=links.find(y=>y.arr_id==b.dataset.un);
     if(!confirm(`This title is not ${A}'s "${l.title}${l.year?" ("+l.year+")":""}"?\n\nVODgrab will stop offering it to ${A} for that ${w} and remove it from Wanted.`))return;
-    try{const r=await api("link",{kind,xid:id,unlink:+b.dataset.un});drawLinks(kind,id,r.links);toast(`Unlinked from ${A}`)}catch(e){toast(e.message,1)}});
+    try{const r=await api("link",{kind,xid:id,unlink:+b.dataset.un});drawLinks(kind,id,r.links);toast(`Unlinked from ${A}`+(r.cancelled?` · cancelled ${r.cancelled} download${r.cancelled==1?"":"s"} meant for it`:""))}catch(e){toast(e.message,1)}});
   $("#lnkChg").onclick=()=>{const pk=$("#lnkPick");pk.innerHTML=`<input id="lnkQ" placeholder="Search ${A}'s library" style="margin-top:8px;width:100%;max-width:420px"><div id="lnkRes" style="margin-top:6px"></div>`;
     const q=$("#lnkQ");q.focus();let tm;q.oninput=()=>{clearTimeout(tm);tm=setTimeout(async()=>{if(q.value.trim().length<2){$("#lnkRes").innerHTML="";return}
       const r=(await api(`arrsearch?kind=${kind}&q=${encodeURIComponent(q.value)}`)).filter(c=>!links.some(l=>l.arr_id==c.arr_id));
       $("#lnkRes").innerHTML=r.length?r.map(c=>`<div class="src"><span class="pn">${esc(c.title)}${c.year?` (${c.year})`:""}</span><span class="mi">${esc(ids(c))}</span>
         <button class="btn s p" data-ln="${c.arr_id}">Link</button></div>`).join(""):`<div class="muted">Nothing in ${A} matches.</div>`;
       $$("[data-ln]",$("#lnkRes")).forEach(b=>b.onclick=async()=>{
-        try{const r=await api("link",{kind,xid:id,link:+b.dataset.ln,unlink:links.map(l=>l.arr_id)});drawLinks(kind,id,r.links);toast(`Linked in ${A}`)}catch(e){toast(e.message,1)}})},250)}}}
+        try{const r=await api("link",{kind,xid:id,link:+b.dataset.ln,unlink:links.map(l=>l.arr_id)});drawLinks(kind,id,r.links);toast(`Linked in ${A}`+(r.cancelled?` · cancelled ${r.cancelled} download${r.cancelled==1?"":"s"} meant for the old link`:""))}catch(e){toast(e.message,1)}})},250)}}}
 async function openMovie(id){
   modal(`<div class="head"><div>Loading…</div><button class="x">×</button></div>`);
   let x;try{x=await api("movie/"+id)}catch(e){toast(e.message,1);closeModal();return}
@@ -7859,8 +7914,9 @@ async function openSeries(id){
     <div class="tools"><button class="btn" id="dls">Download season</button><button class="btn" id="dla">Download all seasons</button>${nowBox}</div>
     ${x.info_error?`<div class="muted">Episode list failed: ${esc(x.info_error)}</div>`:""}
     <div id="playbox"></div><div class="eps2" id="eps">${x.seasons.length?"":`<div class="muted">No episodes listed by the provider.</div>`}</div></div>
+    ${x.arr_ok?`<div class="sec" id="linkSec"></div>`:""}
     ${peopleHtml(m)}${watchHtml(m)}${recsHtml(m)}${kwHtml(m)}${idsHtml("series",m,x)}</div>`);
-  wireDetail("series",m);
+  wireDetail("series",m);if(x.arr_ok)drawLinks("series",id,x.links);
   $$("#stabs button").forEach(b=>b.onclick=()=>{cur=+b.dataset.s;draw()});
   if($("#adds"))$("#adds").onclick=e=>addArr([{kind:"series",id}],e.target);
   $("#dls").onclick=()=>cur!=null&&dl({kind:"season",id,season:cur,now:$("#now").checked});
