@@ -2,6 +2,14 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.3 (2026-11-08)
+
+- **Release group.** Radarr and Sonarr showed VODgrab downloads with no release group, because names ended in `.IPTV`. Set one in **Settings → Folders → Release group** (for example `VODgrab`), or give each provider its own in its card. Names then end in `-VODgrab`, and Radarr and Sonarr show it as the release group, including on manual imports (using the provider the file actually came from). Leave it blank to keep the old names.
+- **Every failed import is in the log now, with the reason.** Before, a refusal from Radarr or Sonarr only showed in History, and an unexpected error could leave a download stuck on Importing.
+- **Clear message when Radarr or Sonarr can't see the download folder**, for example: "Radarr can't see /downloads/iptv/manual/movies/… Give Radarr the same folder at the same path." Once fixed, press **Retry import** in History; there's no need to download again.
+- **Movies get the length check too:** a "movie" far shorter than Radarr's runtime (a 1-minute trailer or placeholder) is not imported, and the reason says to try another provider's copy.
+- **Wanted:** "Import failed" and "Download failed" are short now; click them to drop down the full reason and a link to History.
+
 ## 1.16.2 (2026-11-07)
 
 - **Fix a show linked to the wrong Sonarr series.** A show's details now have the **Linked in Sonarr** section that movies already had: **Not this show** unlinks it, and **Link to a different show** picks the right one from your Sonarr library. Unlinking also cancels manual downloads that were still waiting or downloading for the wrong show.

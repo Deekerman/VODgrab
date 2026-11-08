@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.2"
+VERSION = "1.16.3"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -76,6 +76,7 @@ DEFAULTS = {
     "radarr_url": "",
     "radarr_api_key": "",
     "radarr_link_url": "",
+    "release_group": "",
     "sonarr_link_url": "",
     "radarr_root": "",
     "radarr_profile_id": 0,
@@ -312,6 +313,8 @@ def init_db():
     pcols = {r["name"] for r in q("PRAGMA table_info(providers)")}
     if "source" not in pcols:
         ex("ALTER TABLE providers ADD COLUMN source TEXT DEFAULT ''")
+    if "release_group" not in pcols:
+        ex("ALTER TABLE providers ADD COLUMN release_group TEXT DEFAULT ''")
     if "prov" not in cols:
         ex("ALTER TABLE jobs ADD COLUMN prov INTEGER DEFAULT 0")
     have = {r["name"] for r in q("PRAGMA table_info(sync_runs)")}
@@ -472,6 +475,8 @@ def save_provider(data):
             "enabled": 1 if data.get("enabled", True) not in (False, 0, "0", "false") else 0}
     if "source" in data:
         vals["source"] = data.get("source") or ""
+    if "release_group" in data:
+        vals["release_group"] = clean_group(data.get("release_group"))
     if data.get("password"):
         vals["password"] = data["password"]
     if pid:
@@ -512,6 +517,7 @@ def providers_view():
     out = []
     for p in PROVIDERS.values():
         d = {k: p[k] for k in ("id", "name", "url", "username", "user_agent", "max_conn", "priority", "enabled")}
+        d["release_group"] = p.get("release_group") or ""
         d["source"] = p.get("source") or ""
         d["password_set"] = bool(p.get("password"))
         d["active"] = ENGINE.active_count(p["id"])
@@ -2763,12 +2769,30 @@ def ep_label(show, e):
     return base + (" · " + e["title"] if e["title"] else "")
 
 
+def clean_group(g):
+    """Release group as Radarr and Sonarr read it: letters and digits only."""
+    return re.sub(r"[^A-Za-z0-9]", "", str(g or ""))[:24]
+
+
+def release_group(pid=None):
+    """The provider's own release group, else the one for everything from Settings ('' for none)."""
+    p = PROVIDERS.get(int(pid)) if pid else None
+    return clean_group((p or {}).get("release_group") or S().get("release_group"))
+
+
+def with_group(parts, row):
+    """Release name ending in -GROUP (which the arrs read as the release group) when one is set; otherwise the
+    plain .IPTV ending VODgrab always used."""
+    g = release_group(dec(row["id"])[0] if row else None)
+    return rel_name(*(parts + ["WEB-DL"])) + "-" + g if g else rel_name(*(parts + ["WEB-DL", "IPTV"]))
+
+
 def movie_release(title, year, name, row=None):
-    return rel_name(title, year, quality_for(row, name), "WEB-DL", "IPTV")
+    return with_group([title, year, quality_for(row, name)], row)
 
 
 def episode_release(title, season, episode, name, row=None):
-    return rel_name(title, "S%02dE%02d" % (season, episode), quality_for(row, name), "WEB-DL", "IPTV")
+    return with_group([title, "S%02dE%02d" % (season, episode), quality_for(row, name)], row)
 
 
 def found_tmdb(kind, work):
@@ -3050,6 +3074,18 @@ class ProviderDown(RuntimeError):
 
 class ImportRefused(Exception):
     """VODgrab will not hand the file to Radarr or Sonarr (the movie or episode already has a file)."""
+
+
+def check_length(j, meta, runtime, title, what):
+    """A movie far shorter or longer than Radarr's runtime is a trailer, a placeholder or another title."""
+    mm = re.search(r"(\d+) min", str(meta.get("probe") or ""))
+    run = to_int(runtime) or 0
+    if not mm or run < 5:
+        return
+    got = int(mm.group(1))
+    if got < run * 0.5 or got > run * 2.2:
+        raise ImportRefused("This file is %d min but Radarr says %s runs %d min, so it is probably a trailer, a "
+                            "placeholder or a different %s. Try another provider's copy." % (got, title, run, what))
 
 
 class Limited(Exception):
@@ -3566,7 +3602,12 @@ class Engine:
             upd(jid, status="import_failed", error=str(e))
             log("Import failed for %s: %s" % (j["release"], e), "warn")
         except ArrError as e:
-            upd(jid, status="import_failed", error=str(e))
+            upd(jid, status="import_failed", error=mask(str(e)))
+            log("Import failed for %s: %s" % (j["release"], mask(str(e))), "warn")
+        except Exception as e:  # never leave a download stuck on Importing
+            upd(jid, status="import_failed", error=mask(str(e)))
+            log("Import failed for %s: %s" % (j["release"], mask(str(e))), "error")
+            log(traceback.format_exc(), "error")
 
     def import_target(self, arr, j):
         """The exact Radarr movie or Sonarr episode this download is for, as IDs, or None when unknown.
@@ -3581,7 +3622,8 @@ class Engine:
             mv = arr.get("/api/v3/movie/%s" % mid) or {}
             if not mv.get("id"):
                 return None
-            out = {"movie": mv["id"], "what": mv.get("title") or "this movie"}
+            out = {"movie": mv["id"], "what": mv.get("title") or "this movie", "prov": j["prov"]}
+            check_length(j, meta, mv.get("runtime"), mv.get("title") or "this movie", "movie")
             if mv.get("hasFile"):
                 out["have"] = ((mv.get("movieFile") or {}).get("quality") or {}).get("quality") or {}
             return out
@@ -3601,7 +3643,7 @@ class Engine:
                        if e.get("seasonNumber") == meta["season"] and e.get("episodeNumber") == meta.get("ep")), None)
         if not ep or not ep.get("id"):
             return None
-        out = {"series": ep.get("seriesId") or sid, "episode": ep["id"],
+        out = {"series": ep.get("seriesId") or sid, "episode": ep["id"], "prov": j["prov"],
                "what": "S%02dE%02d" % (meta["season"], meta.get("ep") or 0)}
         # A file far shorter or longer than the show's episodes is most likely another show with the same name,
         # linked by mistake; importing it by ID would put it in the wrong show.
@@ -3635,8 +3677,18 @@ class Engine:
             params["movieId"] = target["movie"]
         else:
             params["seriesId"] = target["series"]
-        items = arr.get("/api/v3/manualimport", **params) or []
+        try:
+            items = arr.get("/api/v3/manualimport", **params) or []
+        except ArrError as e:
+            raise ImportRefused("%s could not read the folder %s (%s). Give %s the same folder at the same path, or "
+                                "change Settings, Folders, Finished manual %s downloads." % (
+                                    arr.label, os.path.dirname(path), mask(str(e)), arr.label,
+                                    "movie" if "movie" in target else "TV"))
         it = next((x for x in items if os.path.basename(x.get("path") or "") == os.path.basename(path)), None)
+        if not it:
+            raise ImportRefused("%s can't see %s. Give %s the same folder at the same path (as VODgrab sees it), or "
+                                "change Settings, Folders, Finished manual %s downloads." % (
+                                    arr.label, path, arr.label, "movie" if "movie" in target else "TV"))
         if not it or not it.get("quality"):
             return None
         if "have" in target:  # already has a file: only a higher resolution replaces it
@@ -3651,6 +3703,9 @@ class Engine:
             body["movieId"] = target["movie"]
         else:
             body.update(seriesId=target["series"], episodeIds=[target["episode"]])
+        g = release_group(target.get("prov"))
+        if g:
+            body["releaseGroup"] = g
         return body
 
     def rejections(self, arr, path):
@@ -5131,10 +5186,10 @@ def config_import(cfg):
                     c.execute("DELETE FROM providers WHERE id=?", (r["id"],))
             for p in provs:
                 c.execute("INSERT OR REPLACE INTO providers(id, name, url, username, password, user_agent, max_conn, "
-                          "priority, enabled, source) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                          "priority, enabled, source, release_group) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                           (p.get("id"), p.get("name"), p.get("url"), p.get("username"), p.get("password"),
                            p.get("user_agent"), p.get("max_conn") or 1, p.get("priority") or 0,
-                           1 if p.get("enabled", 1) else 0, p.get("source") or ""))
+                           1 if p.get("enabled", 1) else 0, p.get("source") or "", p.get("release_group") or ""))
             c.execute("DELETE FROM overrides")
             for o in cfg.get("overrides") or []:
                 c.execute("INSERT OR REPLACE INTO overrides(arr, arr_id, xid) VALUES(?,?,?)",
@@ -7335,6 +7390,9 @@ input[type=checkbox]{width:auto}
 .st{font-size:11px;padding:2px 8px;border-radius:5px;font-weight:600}
 .st.imported,.st.completed{background:#16352a;color:var(--ok)}
 .st.failed,.st.import_failed{background:#3a1d1d;color:var(--bad)}
+.werr{display:inline-block;vertical-align:top;max-width:460px}.werr summary{cursor:pointer;color:var(--bad);list-style:none}
+.werr summary::-webkit-details-marker{display:none}.werr summary::after{content:" ▸"}.werr[open] summary::after{content:" ▾"}
+.werr>div{margin-top:4px;padding:6px 8px;border-radius:6px;background:#3a1d1d;color:var(--text);white-space:normal;line-height:1.4}
 .st.downloading,.st.verifying,.st.importing{background:#1c2c45;color:var(--info)}
 .st.queued,.st.retry_wait{background:#352a16;color:var(--acc)}
 .st.cancelled,.st.retried{background:var(--panel2);color:var(--dim)}
@@ -7996,7 +8054,7 @@ function wDraw(){const box=$("#wlist");if(!box)return;wWriteHash();
   btn.onclick=e=>{if(confirm(`Ask ${ids.m.length?`Radarr to search ${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`Sonarr to search ${ids.e.length} episode${ids.e.length==1?"":"s"}`:""}?`))wGo(ids.m,ids.e,e.target)};
   const gb=$("#wGrab");gb.disabled=!n;gb.textContent=n?`Download these ${n} manually`:"Nothing to download";
   gb.onclick=e=>{if(confirm(`Download ${ids.m.length?`${ids.m.length} movie${ids.m.length==1?"":"s"}`:""}${ids.m.length&&ids.e.length?" and ":""}${ids.e.length?`${ids.e.length} episode${ids.e.length==1?"":"s"}`:""} with VODgrab now, without a Radarr or Sonarr search? They are imported when done.`))wGrab(ids.m,ids.e,e.target)};
-  const jst=(g,j)=>!g?"":!j?`queued in VODgrab ${ago(g)}`:["failed","import_failed"].includes(j.status)?`<a href="#history" onclick="go('history');return false" style="color:var(--bad)">${j.status=="failed"?"Download failed":"Import failed"}${j.error?": "+esc(j.error):""}</a>`:j.status=="cancelled"?"download cancelled":["downloading","verifying","importing"].includes(j.status)?`${STL[j.status].toLowerCase()} in VODgrab`:`${(STL[j.status]||j.status).toLowerCase()} in VODgrab ${ago(g)}`;
+  const jst=(g,j)=>!g?"":!j?`queued in VODgrab ${ago(g)}`:["failed","import_failed"].includes(j.status)?`<details class="werr"><summary>${j.status=="failed"?"Download failed":"Import failed"}</summary><div>${j.error?esc(j.error)+" · ":""}<a href="#history" onclick="go('history');return false">Open History</a></div></details>`:j.status=="cancelled"?"download cancelled":["downloading","verifying","importing"].includes(j.status)?`${STL[j.status].toLowerCase()} in VODgrab`:`${(STL[j.status]||j.status).toLowerCase()} in VODgrab ${ago(g)}`;
   const srch=(t,g,j)=>(t?`<span class="muted" style="font-size:12px">searched ${ago(t)}</span>`:"")+(g?`<span class="muted" style="font-size:12px">${t?" · ":""}${jst(g,j)}</span>`:"");
   const nE=ids.e.length;
   box.innerHTML=(movies.length?`<h3 class="wh">Movies <span class="muted">${movies.length}</span></h3><div class="list">${movies.map(x=>`<div class="row" data-l="${skl(x.card.clean)}"><div class="main"><div class="title">${esc(x.card.clean)} ${x.card.year?`<span class="muted">(${x.card.year})</span>`:""}</div>
@@ -8085,6 +8143,7 @@ function provCard(p){const n=!p.id;return `<div class="prov" data-pid="${p.id||"
    <div class="f"><label>Max connections</label><input data-f="max_conn" type="number" min="1" max="20" value="${p.max_conn||1}"><div class="hint">Streams VODgrab may use at once on this account</div></div>
    <div class="f"><label>Priority</label><input data-f="priority" type="number" min="1" value="${p.priority||""}" placeholder="Next"><div class="hint">1 is tried first</div></div>
    <div class="f"><label>User agent</label><input data-f="user_agent" value="${esc(p.user_agent||"")}" placeholder="VLC/3.0.20 LibVLC/3.0.20"></div>
+   <div class="f"><label>Release group</label><input data-f="release_group" value="${esc(p.release_group||"")}" placeholder="${esc(SV.settings.release_group||"None")}"><div class="hint">Shown as the release group in Radarr and Sonarr for this provider's downloads. Blank uses the one in Settings, Folders.</div></div>
    <div class="f chk"><input type="checkbox" data-f="enabled" ${p.enabled!==0?"checked":""}><label style="margin:0;color:var(--text)">Enabled</label></div></div>
   <div class="tools" style="margin-top:12px;margin-bottom:0"><button class="btn p s" data-ps>Save provider</button>${n?"":`<button class="btn s" data-pt>Test connection and file download</button><button class="btn s d" data-pd>Remove</button>`}</div>
   <div class="out"></div></div>`}
@@ -8135,7 +8194,8 @@ async function renderSettings(){
     ${pathFld("manual_movies_path","manual_movies","Finished manual movie downloads")}
     ${fld("chown","Owner for new files (uid:gid)","text","Optional, for example 1000:1000")}
     ${fld("external_url","Address the arrs use to reach VODgrab","text","Filled in by automatic setup")}
-    ${fld("auto_import_manual","Hand manual downloads to Sonarr and Radarr for import","bool")}</div></section>
+    ${fld("auto_import_manual","Hand manual downloads to Sonarr and Radarr for import","bool")}
+    ${fld("release_group","Release group","text","Letters and digits, for example VODgrab. Radarr and Sonarr show it as the release group (names end in -VODgrab instead of .IPTV). Each provider can have its own in its card. Blank for none.")}</div></section>
   <section class="set"><h3>Downloads</h3><div class="fields">
     ${fld("concurrency","Total streams across all providers","number","0 means no total limit; each provider still has its own max")}
     ${fld("retries","Retry count","number","Attempts after the first failure")}
