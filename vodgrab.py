@@ -15,6 +15,7 @@ import collections
 import datetime as dt
 import difflib
 import email.utils
+import functools
 import gzip
 import json
 import os
@@ -38,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.3"
+VERSION = "1.16.4"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -1443,8 +1444,24 @@ def arr_page_by_id(kind, arr_id):
     return arr_page(kind, q1("SELECT * FROM arr_lib WHERE kind=? AND arr_id=?", kind, arr_id)) if arr_id else None
 
 
+_page_memo = {}
+
+
 def job_arr_page(j):
-    """The Radarr movie or Sonarr series a download is for, as a link (History)."""
+    """The Radarr movie or Sonarr series a download is for, as a link (History). Remembered for a minute, since
+    History lists hundreds of downloads of the same few titles."""
+    key = (j["kind"], j["meta"])
+    hit = _page_memo.get(key)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    if len(_page_memo) > 5000:
+        _page_memo.clear()
+    url = _job_arr_page(j)
+    _page_memo[key] = (time.time(), url)
+    return url
+
+
+def _job_arr_page(j):
     meta = jmeta(j)
     kind = "movie" if j["kind"] == "movie" else "series"
     lib = None
@@ -2312,6 +2329,12 @@ def wanted_view():
             rep_of[key] = card(r) if r else None
         return rep_of[key]
 
+    # Open in Radarr/Sonarr links for every row in one query instead of one lookup per row
+    pages = {}
+    if arr_web("radarr") or arr_web("sonarr"):
+        for lr in q("SELECT * FROM arr_lib WHERE (kind='movie' AND arr_id IN (SELECT arr_id FROM wanted WHERE "
+                    "kind='movie')) OR (kind='series' AND arr_id IN (SELECT arr_id FROM wanted WHERE kind='series'))"):
+            pages[(lr["kind"], lr["arr_id"])] = arr_page(lr["kind"], lr)
     for r in q("SELECT w.*, j.status AS jst, j.error AS jerr FROM wanted w LEFT JOIN jobs j ON j.id=w.job "
                "ORDER BY w.kind, w.title"):
         c = rep(r["kind"], r["work"])
@@ -2321,11 +2344,11 @@ def wanted_view():
         if r["kind"] == "movie":
             movies.append({"arr_id": r["arr_id"], "title": r["title"], "card": c, "searched": r["searched"],
                            "found": r["found"], "grabbed": r["grabbed"], "job": jb,
-                           "arr_url": arr_page_by_id("movie", r["arr_id"])})
+                           "arr_url": pages.get(("movie", r["arr_id"]))})
         else:
             if r["arr_id"] not in shows_ep:
                 shows_ep[r["arr_id"]] = {"arr_id": r["arr_id"], "card": c, "episodes": [],
-                                         "arr_url": arr_page_by_id("series", r["arr_id"])}
+                                         "arr_url": pages.get(("series", r["arr_id"]))}
             sh = shows_ep[r["arr_id"]]
             sh["episodes"].append({"arr_ep": r["arr_ep"], "season": r["season"], "episode": r["episode"],
                                    "title": r["title"], "air": r["air"], "available": bool(r["available"]),
@@ -3672,19 +3695,23 @@ class Engine:
     def exact_import(self, arr, path, target):
         """ManualImport entry that names the movie or episode, so the arr doesn't guess from the file name
         (scene numbering on TheXEM, several series with the same title)."""
-        params = {"folder": os.path.dirname(path), "filterExistingFiles": "false"}
-        if "movie" in target:
-            params["movieId"] = target["movie"]
-        else:
-            params["seriesId"] = target["series"]
-        try:
-            items = arr.get("/api/v3/manualimport", **params) or []
-        except ArrError as e:
+        # Ask about the file itself, without a movie or series ID: given an ID (and no download ID), Radarr and
+        # Sonarr list that title's existing files instead of the folder. The IDs are set in the import below.
+        it, err = None, None
+        for where in (path, os.path.dirname(path)):
+            try:
+                items = arr.get("/api/v3/manualimport", folder=where, filterExistingFiles="false") or []
+            except ArrError as e:
+                err = e
+                continue
+            it = next((x for x in items if os.path.basename(x.get("path") or "") == os.path.basename(path)), None)
+            if it:
+                break
+        if not it and err:
             raise ImportRefused("%s could not read the folder %s (%s). Give %s the same folder at the same path, or "
                                 "change Settings, Folders, Finished manual %s downloads." % (
-                                    arr.label, os.path.dirname(path), mask(str(e)), arr.label,
+                                    arr.label, os.path.dirname(path), mask(str(err)), arr.label,
                                     "movie" if "movie" in target else "TV"))
-        it = next((x for x in items if os.path.basename(x.get("path") or "") == os.path.basename(path)), None)
         if not it:
             raise ImportRefused("%s can't see %s. Give %s the same folder at the same path (as VODgrab sees it), or "
                                 "change Settings, Folders, Finished manual %s downloads." % (
@@ -5512,6 +5539,7 @@ def parse_query(text):
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def lib_sql(kind, a="t", tcol=None):
     """SQL for 'this title is in Radarr/Sonarr', 'has a file there' and 'VODgrab downloaded it'."""
     k = "movie" if kind == "movie" else "series"
@@ -6263,7 +6291,7 @@ class Handler(BaseHTTPRequestHandler):
         headers = dict(headers or {})
         if len(body) > 1024 and not ctype.startswith("image/") and "Content-Encoding" not in headers and \
                 "gzip" in (self.headers.get("Accept-Encoding") or ""):
-            body = UI_GZ if body is UI_BYTES else gzip.compress(body, 5)  # JSON and XML shrink 5 to 10 times
+            body = UI_GZ if body is UI_BYTES else gzip.compress(body, 1)  # fastest level: JSON and XML still shrink 10 times
             headers["Content-Encoding"] = "gzip"
             headers["Vary"] = "Accept-Encoding"
         self.send_response(code)

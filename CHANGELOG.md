@@ -2,6 +2,12 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.4 (2026-11-08)
+
+- **Fixed: "Sonarr can't see …" / "Radarr can't see …" on files they can see.** To read a download's quality, VODgrab asked Sonarr or Radarr about the folder and passed the show or movie ID. With an ID they list that title's *existing* files instead of the folder, so the new file never showed up. VODgrab now asks about the file itself, then imports it into the exact episode or movie. Press **Retry import** in History on the ones that failed.
+- Until now that same mix-up meant manual downloads quietly fell back to Sonarr and Radarr guessing from the file name. The exact import from 1.16.0 (and the length checks) now really run.
+- Wanted and History build their Open in Radarr/Sonarr links in one go instead of one lookup per row, and replies are compressed with the fastest setting, which is easier on low-power servers.
+
 ## 1.16.3 (2026-11-08)
 
 - **Release group.** Radarr and Sonarr showed VODgrab downloads with no release group, because names ended in `.IPTV`. Set one in **Settings → Folders → Release group** (for example `VODgrab`), or give each provider its own in its card. Names then end in `-VODgrab`, and Radarr and Sonarr show it as the release group, including on manual imports (using the provider the file actually came from). Leave it blank to keep the old names.
