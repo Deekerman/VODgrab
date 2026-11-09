@@ -2,6 +2,14 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.16.5 (2026-11-09)
+
+- **Fixed: downloads stopping for good.** If the database was busy at the moment a download started (for example during a catalog rebuild), its download slot was reserved but the download never ran, so the queue could stall until a restart. Resume and Retry couldn't help. Now nothing is reserved until the download really starts, and any slot without a running download is freed automatically.
+- **Shorter database pauses.** A catalog sync or recheck where every provider failed (like a 503) no longer rebuilds the title list. A real rebuild now keeps the database locked for much less time, and status updates and Sonarr/Radarr webhooks wait out a short lock instead of failing.
+- **"Import failed: Manually imported 1 files"** is explained now. VODgrab checks whether the episode or movie really got the file: if it did (Sonarr copied it), the download counts as imported. If not, the reason says Sonarr or Radarr skipped it, usually because its quality profile doesn't allow that quality.
+- **No more daily re-grabs of missing titles.** When a provider answers "title not found (404)" to a download, that copy isn't offered to Sonarr or Radarr for a week (it was a day), so they stop grabbing the same dead copy every day.
+- **History: Retry failed** button. Retries every failed download and failed import at once, each release once, and skips releases that were downloaded or queued again since.
+
 ## 1.16.4 (2026-11-08)
 
 - **Fixed: "Sonarr can't see …" / "Radarr can't see …" on files they can see.** To read a download's quality, VODgrab asked Sonarr or Radarr about the folder and passed the show or movie ID. With an ID they list that title's *existing* files instead of the folder, so the new file never showed up. VODgrab now asks about the file itself, then imports it into the exact episode or movie. Press **Retry import** in History on the ones that failed.

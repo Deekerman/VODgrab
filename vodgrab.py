@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.4"
+VERSION = "1.16.5"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -1665,7 +1665,8 @@ def run_sync(trigger="schedule", only=None):
             ex("PRAGMA optimize=0x10002")
         except sqlite3.Error:
             pass
-        catalog_changed(warm=True)
+        if detail:  # nothing to rebuild when every provider failed (for example a 503 during a recheck)
+            catalog_changed(warm=True)
         threading.Thread(target=refresh_library, daemon=True).start()
         err = "; ".join(errors)
         ok = len(errors) < len(provs)
@@ -2437,13 +2438,18 @@ def probe_fresh(cid):
     if not r:
         return False
     age = time.time() - (r["at"] or 0)
-    return age < (86400 if r["error"] else S()["probe_max_age_days"] * 86400)
+    return age < (probe_err_age(r["error"]) if r["error"] else S()["probe_max_age_days"] * 86400)
+
+
+def probe_err_age(error):
+    """How long a failed check counts: a week when a download was told the title is gone, else a day."""
+    return 7 * 86400 if str(error).startswith("gone:") else 86400
 
 
 def probe_missing(cid):
     """True when a recent check found the file missing or unreadable on the provider."""
     r = q1("SELECT at, error FROM probes WHERE id=?", cid)
-    return bool(r and r["error"] and time.time() - (r["at"] or 0) < 86400)
+    return bool(r and r["error"] and time.time() - (r["at"] or 0) < probe_err_age(r["error"]))
 
 
 def _probe_run(kind, cid):
@@ -2743,7 +2749,14 @@ def job(jid):
 def upd(jid, **kw):
     kw["updated"] = time.time()
     cols = ", ".join("%s=?" % k for k in kw)
-    ex("UPDATE jobs SET %s WHERE id=?" % cols, *(list(kw.values()) + [jid]))
+    for attempt in range(3):  # a busy database (a long catalog write) is worth waiting out, not crashing on
+        try:
+            ex("UPDATE jobs SET %s WHERE id=?" % cols, *(list(kw.values()) + [jid]))
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or attempt == 2:
+                raise
+            time.sleep(1 + attempt * 2)
 
 
 def jmeta(j):
@@ -3296,6 +3309,15 @@ class Engine:
                 d["checking"] = True
                 threading.Thread(target=self.health_check, args=(pid,), daemon=True).start()
         with self.lock:
+            # A download slot whose thread is not running (it never started, or died) is freed, so one failure
+            # can't keep the queue stuck until a restart; its job goes back in the queue.
+            for jid, (th, flag, pid) in list(self.workers.items()):
+                if not th.is_alive():
+                    self.workers.pop(jid, None)
+                    self.progress.pop(jid, None)
+            for r in q("SELECT id FROM jobs WHERE status IN ('downloading','verifying')"):
+                if r["id"] not in self.workers:
+                    upd(r["id"], status="queued", error="")
             for jid, (th, flag, pid) in list(self.workers.items()):
                 j = job(jid)
                 if j and not j["force"] and (paused or (not in_win and s["on_window_end"] == "pause")):
@@ -3322,11 +3344,15 @@ class Engine:
                     self.wait_on_down(r, t)
                     continue
                 cid, ext, pid = got
+                try:  # mark it first: if the database is busy, try again next round with nothing reserved
+                    upd(r["id"], status="downloading", started=time.time(), prov=pid)
+                except sqlite3.OperationalError as e:
+                    log("Could not start %s yet (%s); trying again shortly" % (r["release"], e), "warn")
+                    break
                 flag = Flag()
                 th = threading.Thread(target=self.run, args=(r["id"], flag, cid, ext, pid), daemon=True)
                 self.workers[r["id"]] = (th, flag, pid)
                 per[pid] += 1
-                upd(r["id"], status="downloading", started=time.time(), prov=pid)
                 th.start()
                 running += 1
 
@@ -3425,6 +3451,8 @@ class Engine:
             upd(jid, status="queued", next_at=0, error="%s: %s" % (name, e))
             return
         except Fatal as e:
+            if "not found" in str(e):  # the provider says this copy is gone: stop offering it for a week
+                ex("INSERT OR REPLACE INTO probes(id, at, error) VALUES(?,?,?)", cid, time.time(), "gone: %s" % e)
             return self.next_source(jid, cid, "%s: %s" % (name, e))
         except Limited as e:
             self.cool[pid] = time.time() + 120
@@ -3617,8 +3645,25 @@ class Engine:
                     else:
                         ex("DELETE FROM wanted WHERE kind='series' AND arr_ep=?", target["episode"])
                 return
-            reason = (self.rejections(arr, path) if not body else "") or c.get("message") or \
-                "%s did not import the file" % arr.label
+            if body and target:  # the command ran: did the movie or episode get its file?
+                got = "have" not in target and self.has_file(arr, target)  # (an upgrade: the old file counts)
+                if got:
+                    if under(path, "manual_tv", "manual_movies"):  # imported as a copy; drop VODgrab's leftover
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                    upd(jid, status="imported", error="")
+                    log("Imported %s into %s" % (j["release"], arr.label))
+                    ex("DELETE FROM wanted WHERE kind=? AND %s=?" % ("arr_id" if "movie" in target else "arr_ep"),
+                       "movie" if "movie" in target else "series", target.get("movie") or target["episode"])
+                    return
+                qn = ((body.get("quality") or {}).get("quality") or {}).get("name") or "this quality"
+                reason = ("%s accepted the import but did not take the file. It usually skips files its quality "
+                          "profile doesn't allow (this one is %s): check the %s's quality profile in %s, or download "
+                          "a better copy." % (arr.label, qn, "movie" if "movie" in target else "show", arr.label))
+            else:
+                reason = self.rejections(arr, path) or c.get("message") or "%s did not import the file" % arr.label
             upd(jid, status="import_failed", error=reason)
             log("Import failed for %s: %s" % (j["release"], reason), "warn")
         except ImportRefused as e:
@@ -3735,6 +3780,14 @@ class Engine:
             body["releaseGroup"] = g
         return body
 
+    def has_file(self, arr, target):
+        try:
+            if "movie" in target:
+                return bool((arr.get("/api/v3/movie/%s" % target["movie"]) or {}).get("hasFile"))
+            return bool((arr.get("/api/v3/episode/%s" % target["episode"]) or {}).get("hasFile"))
+        except ArrError:
+            return False
+
     def rejections(self, arr, path):
         try:
             items = arr.get("/api/v3/manualimport", folder=os.path.dirname(path), filterExistingFiles="false") or []
@@ -3808,6 +3861,32 @@ def history_clear(what):
     log("History: removed %d %s entr%s%s" % (removed, "" if what == "all" else what, "y" if removed == 1 else "ies",
                                             " (kept %d still waiting for Radarr/Sonarr)" % kept if kept else ""))
     return {"removed": removed, "kept": kept}
+
+
+def history_retry():
+    """Retry every failed download and failed import in History, once per release, skipping releases that were
+    downloaded or imported since or are already in the queue."""
+    out = {"queued": 0, "imports": 0, "searches": 0, "skipped": 0, "errors": []}
+    seen = set()
+    for j in q("SELECT * FROM jobs WHERE hidden=0 AND status IN ('failed','import_failed') ORDER BY updated DESC"):
+        if j["release"] in seen:
+            out["skipped"] += 1
+            continue
+        seen.add(j["release"])
+        if q1("SELECT 1 FROM jobs WHERE release=? AND id<>? AND status IN ('queued','retry_wait','downloading',"
+              "'verifying','importing','completed','imported')", j["release"], j["id"]):
+            out["skipped"] += 1
+            continue
+        try:
+            job_action(j["id"], "retry")
+            key = "imports" if j["status"] == "import_failed" else "searches" if j["source"] == "arr" else "queued"
+            out[key] += 1
+        except Exception as e:
+            if len(out["errors"]) < 5:
+                out["errors"].append("%s: %s" % (j["label"] or j["release"], mask(str(e))))
+    log("History: retried %d downloads, %d imports, asked for %d new searches (%d skipped)" % (
+        out["queued"], out["imports"], out["searches"], out["skipped"]))
+    return out
 
 
 def job_action(jid, action):
@@ -5581,28 +5660,35 @@ def rebuild_works():
     representative, with genres, services, lists, languages and providers of every copy merged in."""
     ids = ",".join(str(p["id"]) for p in active_providers()) or "0"
     c = db()
+    cols = ("kind, work, rep, clean, norm, year, tmdb, icon, rating_n, first_seen, genres, services, lists, langs, "
+            "provs, adult, np, srch, qrank")
+    # The slow part (grouping every copy of every title) goes into a scratch table first: that only reads the
+    # catalog, so downloads and webhooks can keep writing meanwhile. Only the swap below locks the database.
+    c.execute("DROP TABLE IF EXISTS temp.works_new")
+    c.execute("CREATE TEMP TABLE works_new(%s)" % cols)
+    for kind, table in (("movie", "movies"), ("series", "series")):
+        ig = "COALESCE(t.igenres,'')" if kind == "movie" else "''"
+        qr = QRANK % "t.qual" if kind == "movie" else "9"
+        c.execute("""INSERT INTO temp.works_new(kind, work, rep, clean, norm, year, tmdb, icon, rating_n, first_seen, genres,
+            services, lists, langs, provs, adult, np, srch, qrank)
+            SELECT '%s', r.work, r.id, r.clean, r.norm, r.year, g.tmdb, r.icon, g.rating_n, g.first_seen, g.genres,
+                   g.services, g.lists, g.langs, g.provs, g.adult, g.np, g.srch, g.qrank
+            FROM (SELECT t.id, t.work, t.clean, t.norm, t.year, t.icon,
+                         ROW_NUMBER() OVER (PARTITION BY t.work ORDER BY %s, t.id) rn
+                  FROM %s t WHERE t.prov IN (%s)) r
+            JOIN (SELECT t.work, MAX(t.tmdb) tmdb, MAX(t.rating_n) rating_n, MIN(COALESCE(t.first_seen, 0)) first_seen,
+                         group_concat(COALESCE(t.genres,'') || %s, '') genres,
+                         group_concat(COALESCE(t.services,''), '') services,
+                         group_concat(COALESCE(t.lists,''), '') lists,
+                         group_concat(CASE WHEN t.lang IS NULL THEN '' ELSE '|' || t.lang || '|' END, '') langs,
+                         group_concat('|' || t.prov || '|', '') provs, MAX(COALESCE(t.adult,0)) adult,
+                         COUNT(*) np, group_concat(DISTINCT t.srch) srch, MIN(%s) qrank
+                  FROM %s t WHERE t.prov IN (%s) GROUP BY t.work) g ON g.work=r.work
+            WHERE r.rn=1""" % (kind, prank_sql(), table, ids, ig, qr, table, ids))
     c.execute("BEGIN")
     try:
         c.execute("DELETE FROM works")
-        for kind, table in (("movie", "movies"), ("series", "series")):
-            ig = "COALESCE(t.igenres,'')" if kind == "movie" else "''"
-            qr = QRANK % "t.qual" if kind == "movie" else "9"
-            c.execute("""INSERT INTO works(kind, work, rep, clean, norm, year, tmdb, icon, rating_n, first_seen, genres,
-                services, lists, langs, provs, adult, np, srch, qrank)
-                SELECT '%s', r.work, r.id, r.clean, r.norm, r.year, g.tmdb, r.icon, g.rating_n, g.first_seen, g.genres,
-                       g.services, g.lists, g.langs, g.provs, g.adult, g.np, g.srch, g.qrank
-                FROM (SELECT t.id, t.work, t.clean, t.norm, t.year, t.icon,
-                             ROW_NUMBER() OVER (PARTITION BY t.work ORDER BY %s, t.id) rn
-                      FROM %s t WHERE t.prov IN (%s)) r
-                JOIN (SELECT t.work, MAX(t.tmdb) tmdb, MAX(t.rating_n) rating_n, MIN(COALESCE(t.first_seen, 0)) first_seen,
-                             group_concat(COALESCE(t.genres,'') || %s, '') genres,
-                             group_concat(COALESCE(t.services,''), '') services,
-                             group_concat(COALESCE(t.lists,''), '') lists,
-                             group_concat(CASE WHEN t.lang IS NULL THEN '' ELSE '|' || t.lang || '|' END, '') langs,
-                             group_concat('|' || t.prov || '|', '') provs, MAX(COALESCE(t.adult,0)) adult,
-                             COUNT(*) np, group_concat(DISTINCT t.srch) srch, MIN(%s) qrank
-                      FROM %s t WHERE t.prov IN (%s) GROUP BY t.work) g ON g.work=r.work
-                WHERE r.rn=1""" % (kind, prank_sql(), table, ids, ig, qr, table, ids))
+        c.execute("INSERT INTO works(%s) SELECT %s FROM temp.works_new" % (cols, cols))
         c.execute("UPDATE works SET pgenres=genres, prating=rating_n")
         apply_meta(c)
         if FTS:
@@ -5612,6 +5698,8 @@ def rebuild_works():
     except Exception:
         c.execute("ROLLBACK")
         raise
+    finally:
+        c.execute("DROP TABLE IF EXISTS temp.works_new")
 
 
 def apply_meta(c=None, kind=None, tmdb=None):
@@ -6685,6 +6773,8 @@ class Handler(BaseHTTPRequestHandler):
                      "ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'verifying' THEN 0 WHEN 'importing' THEN 1 "
                      "ELSE 2 END, force DESC, pos")
             return self.send(200, [job_row(j) for j in rows])
+        if a == "history" and method == "POST" and len(parts) > 1 and parts[1] == "retry":
+            return self.send(200, history_retry())
         if a == "history" and method == "POST" and len(parts) > 1 and parts[1] == "clear":
             return self.send(200, history_clear(data.get("what")))
         if a == "history":
@@ -8119,15 +8209,19 @@ async function wGrab(movies,episodes,btn){if(btn)btn.disabled=true;
 /* ---------------- history */
 async function renderHistory(){
   const rows=await api("history");const m=$("#main");
-  const nf=rows.filter(j=>["failed","import_failed","cancelled"].includes(j.status)).length,nc=rows.filter(j=>["imported","completed"].includes(j.status)).length;
+  const nr=rows.filter(j=>["failed","import_failed"].includes(j.status)).length,nf=rows.filter(j=>["failed","import_failed","cancelled"].includes(j.status)).length,nc=rows.filter(j=>["imported","completed"].includes(j.status)).length;
   const bar=rows.length?`<div class="tools" style="margin-bottom:12px">
-    <button class="btn s" data-clr="failed" ${nf?"":"disabled"}>Remove failed</button><button class="btn s" data-clr="completed" ${nc?"":"disabled"}>Remove completed</button><button class="btn s d" data-clr="all">Remove all</button></div>`:"";
+    <button class="btn s p" id="retryAll" ${nr?"":"disabled"}>Retry failed${nr?` (${nr})`:""}</button><button class="btn s" data-clr="failed" ${nf?"":"disabled"}>Remove failed</button><button class="btn s" data-clr="completed" ${nc?"":"disabled"}>Remove completed</button><button class="btn s d" data-clr="all">Remove all</button></div>`:"";
   m.innerHTML=bar+(rows.length?`<div class="list">${rows.map(j=>`<div class="row"><div class="main"><div class="title">${esc(j.label)}</div>
     <div class="sub"><span class="tag">${j.source=="arr"?esc(j.arr):"Manual"}</span>${j.provider?`<span class="tag">${esc(j.provider)}</span>`:""}${st(j.status)} ${j.total?fb(j.total)+" · ":""}${j.probe?esc(j.probe)+" · ":""}${ago(j.updated)}</div>
     ${j.error?`<div class="sub" style="color:${["failed","import_failed"].includes(j.status)?"var(--bad)":"var(--dim)"}">${esc(j.error)}</div>`:""}
     <div class="sub">${esc(j.release)}</div></div>
     <div class="acts">${j.arr_url?`<a class="btn s" href="${esc(j.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in ${j.kind=="movie"?"Radarr":"Sonarr"}</a>`:""}${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
     <button class="btn s d" data-a="delete" data-id="${j.id}">${j.status=="import_failed"?"Delete file":"Remove"}</button></div></div>`).join("")}</div>`:`<div class="empty">No history yet.</div>`);
+  if($("#retryAll"))$("#retryAll").onclick=async e=>{
+    if(!confirm(`Retry the ${nr} failed download${nr==1?"":"s"} and import${nr==1?"":"s"}?\n\nEach release is retried once. Failed imports are handed to Radarr/Sonarr again, failed manual downloads go back in the queue, and for failed Radarr/Sonarr grabs VODgrab asks them to search again.`))return;
+    e.target.disabled=true;
+    try{const r=await api("history/retry",{});toast([r.queued?`${r.queued} back in the queue`:"",r.imports?`${r.imports} imports retried`:"",r.searches?`${r.searches} new searches`:"",r.skipped?`${r.skipped} skipped (already done or queued)`:""].filter(Boolean).join(" · ")||"Nothing to retry");renderHistory();refreshStatus()}catch(err){toast(err.message,1);e.target.disabled=false}};
   $$("[data-clr]",m).forEach(b=>b.onclick=async()=>{const w=b.dataset.clr;
     if(!confirm(`Remove ${w=="all"?"all":w} entries from History?\n\nDownloaded files are not touched. Downloads Radarr or Sonarr haven't imported yet are kept.`))return;
     try{const r=await api("history/clear",{what:w});toast(`Removed ${r.removed}`+(r.kept?`, kept ${r.kept} still waiting for Radarr/Sonarr`:""));renderHistory()}catch(e){toast(e.message,1)}});
