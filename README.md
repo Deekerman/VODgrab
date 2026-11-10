@@ -71,7 +71,7 @@ services:
 docker compose up -d
 ```
 
-Open **http://&lt;host&gt;:8765**, add your provider under **Settings → Providers**, and run a sync.
+Open **http://&lt;host&gt;:8765**. On a new install a short setup wizard walks you through adding your provider and connecting Sonarr and Radarr; every step can be skipped, and everything is also under **Settings**.
 
 To build the image from source instead, clone this repo and run `docker compose up -d --build`.
 

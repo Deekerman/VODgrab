@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.16.5"
+VERSION = "1.17.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -165,7 +165,7 @@ PROVIDERS = collections.OrderedDict()  # id -> dict, ordered by priority
 def mask(s):
     s = str(s)
     vals = [SETTINGS.get(k) for k in ("sonarr_api_key", "radarr_api_key", "tmdb_key", "omdb_key", "tvdb_key",
-                                      "dispatcharr_api_key",
+                                      "dispatcharr_api_key", "api_key", "web_password",
                                       "tvdb_pin")]
     for p in list(PROVIDERS.values()):
         vals += [p.get("password"), p.get("username")]
@@ -3156,7 +3156,9 @@ def verify(path, total):
     if not FFPROBE:
         return True, "size check only (ffprobe not installed)"
     try:
-        out = subprocess.run([FFPROBE, "-v", "error", "-show_entries",
+        # -protocol_whitelist file: a downloaded "video" that is really a playlist must not make ffprobe
+        # fetch other addresses from this machine
+        out = subprocess.run([FFPROBE, "-v", "error", "-protocol_whitelist", "file", "-show_entries",
                               "format=duration:stream=codec_type,codec_name,height", "-of", "json", path],
                              capture_output=True, timeout=180)
         data = json.loads(out.stdout or b"{}")
@@ -3515,7 +3517,10 @@ class Engine:
             self.import_manual(jid)
 
     def place(self, j, part):
-        rel, ext = j["release"], j["ext"]
+        # The release name and extension end up in a file path. They come from the provider's catalog (or an
+        # NZB), so keep them to plain file-name characters: nothing here may point outside the download folder.
+        rel = rel_name(j["release"])
+        ext = re.sub(r"[^A-Za-z0-9]", "", str(j["ext"] or ""))[:8] or "mkv"
         if j["source"] == "arr":
             dest_dir = os.path.join(folder(j["arr"]), rel)
             if os.path.exists(dest_dir) and os.listdir(dest_dir):
@@ -5574,12 +5579,6 @@ def restore(found, parts):
     return {"ok": True, "restart": False, "parts": parts}
 
 
-def restart_self():
-    time.sleep(1.5)
-    log("Restarting")
-    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
-
-
 def apply_staged_restore():
     """At startup, before the databases open: swap in files staged by a restore."""
     if not os.path.isdir(RESTORE_DIR):
@@ -6607,6 +6606,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(502, {"error": mask(str(e))})
         except (ValueError, RuntimeError) as e:
             self.send(400, {"error": mask(str(e))})
+        except (TypeError, KeyError) as e:  # a request with a missing or wrong-typed field
+            self.send(400, {"error": "Bad request: %s" % mask(str(e))})
         except Exception as e:
             log(traceback.format_exc(), "error")
             self.send(500, {"error": mask(str(e))})
@@ -6869,9 +6870,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method, p, qs):
         data = {}
+        if method == "POST":
+            # Changes must come from VODgrab's own page (or a script that says it sends JSON). A form or script on
+            # another website can only send plain-text or form posts without asking first, so those are refused:
+            # otherwise any page you visit could change settings here through your browser.
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            if not ctype.startswith(("application/json", "application/octet-stream")):
+                self.close_connection = True
+                return self.send(415, {"error": "Send changes as JSON (Content-Type: application/json)"})
         if method == "POST" and not p.startswith("backup/upload"):
             raw = self.read_body()
             data = json.loads(raw or b"{}") if raw else {}
+            if not isinstance(data, dict):
+                raise ValueError("Send a JSON object")
         parts = p.strip("/").split("/")
         a = parts[0]
         if a == "status":

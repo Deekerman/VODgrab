@@ -2,6 +2,20 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.17.0 (2026-11-10)
+
+- **Setup wizard for new installs.** A fresh VODgrab now opens a short wizard: add your provider (the login is tested and the catalog starts loading), connect Sonarr and Radarr (tested, set up automatically, and checked that they can see VODgrab's download folders), pick the download folder and release group, and optionally add a TMDB key and a page password. Every step can be skipped, every test has a time limit, and Back, Skip and Next always work, so it can't get stuck. Existing installs don't see it; **Settings → Catalog sync → Run setup wizard** opens it any time.
+- **Browse: sort direction button.** An arrow next to the sort box flips any sort (newest or oldest first, A to Z or Z to A, highest or lowest rated). Titles with no year or rating stay at the end either way. "Title Z to A" is now Title plus the arrow.
+- **Duplicate cards are merged.** Copies of one title from different providers showed as separate cards when one provider listed no year, or listed the title under another name. Copies matched to the same TMDB entry are now one card, and a copy with no year joins the same-named title when there is only one it can be. Titles with the same name and different years stay apart. Takes effect at the next catalog sync.
+- **English (TMDB) titles.** A title your provider lists under a foreign name (for example *Révélations Monumentales*) is shown under its TMDB name, with "listed as …" underneath, and can be found by searching either name.
+- **File name beside the quality check.** Each copy in a movie's details shows what the provider lists it as and, once checked, the title stored inside the video file, so you can see it's the right video before downloading.
+- **Security fixes from a code review:**
+  - Another website open in your browser could have changed VODgrab's settings or started downloads behind your back. VODgrab now only accepts changes sent as JSON, which other sites cannot send. If you have your own scripts that post to `/api/...`, add `-H "Content-Type: application/json"`.
+  - File names and extensions from a provider's catalog are cleaned before they are used in a path, so a hostile provider cannot make VODgrab write outside the download folder.
+  - A downloaded "video" that is really a playlist can no longer make the file check contact other addresses.
+  - VODgrab's API key and the page password are hidden in logs, like provider passwords already were.
+- Requests with a missing field answer with a short error instead of a traceback in the log.
+
 ## 1.16.5 (2026-11-09)
 
 - **Fixed: downloads stopping for good.** If the database was busy at the moment a download started (for example during a catalog rebuild), its download slot was reserved but the download never ran, so the queue could stall until a restart. Resume and Retry couldn't help. Now nothing is reserved until the download really starts, and any slot without a running download is freed automatically.
