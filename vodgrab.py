@@ -78,6 +78,7 @@ DEFAULTS = {
     "radarr_api_key": "",
     "radarr_link_url": "",
     "release_group": "",
+    "wizard_done": False,
     "sonarr_link_url": "",
     "radarr_root": "",
     "radarr_profile_id": 0,
@@ -300,7 +301,7 @@ CREATE TABLE IF NOT EXISTS md.meta_kv(k TEXT PRIMARY KEY, v TEXT);
 """
 WORK_META_COLS = [("mt", "INTEGER"), ("pgenres", "TEXT"), ("prating", "REAL"), ("cert", "TEXT"), ("runtime", "INTEGER"),
                   ("pop", "REAL"), ("votes", "INTEGER"), ("mstatus", "TEXT"), ("watch", "TEXT"), ("olang", "TEXT"),
-                  ("poster", "TEXT")]
+                  ("poster", "TEXT"), ("mtitle", "TEXT")]
 
 
 def init_db():
@@ -334,8 +335,10 @@ def init_db():
                 ex("UPDATE series SET eps_fetched=0")
     ex("CREATE TABLE IF NOT EXISTS probes(id INTEGER PRIMARY KEY, width INTEGER, height INTEGER, vcodec TEXT, "
        "duration INTEGER, bitrate INTEGER, size INTEGER, at REAL)")
-    if "error" not in {r["name"] for r in q("PRAGMA table_info(probes)")}:
-        ex("ALTER TABLE probes ADD COLUMN error TEXT")
+    have = {r["name"] for r in q("PRAGMA table_info(probes)")}
+    for col in ("error", "title"):  # title: the name stored inside the video file, when it has one
+        if col not in have:
+            ex("ALTER TABLE probes ADD COLUMN %s TEXT" % col)
     added = False
     for t, cols in (("movies", CAT_COLS + [("qual", "TEXT")]), ("series", CAT_COLS), ("categories", [("grp", "TEXT"),
                                                                                              ("canon", "TEXT")])):
@@ -1041,7 +1044,7 @@ def media_view(row):
             "width": d.get("width"), "height": d.get("height"),
             "codec": CODECS.get((d.get("vcodec") or "").lower(), (d.get("vcodec") or "").upper() or None),
             "duration": d.get("duration"), "bitrate": d.get("bitrate"), "size": size,
-            "checked_at": p["at"] if p else None}
+            "checked_at": p["at"] if p else None, "file_title": p["title"] if p else None}
 
 
 def quality_for(row, name):
@@ -1386,13 +1389,16 @@ def find_catalog(kind, titles, year, tmdb):
 def equivalents(kind, cid):
     """The same movie or series on every enabled provider, best provider first."""
     table = "movies" if kind == "movie" else "series"
-    r = q1("SELECT id, norm, year, tmdb FROM %s WHERE id=?" % table, cid)
+    r = q1("SELECT id, norm, year, tmdb, work FROM %s WHERE id=?" % table, cid)
     if not r:
         return []
     rows = q("SELECT id FROM %s WHERE %s AND ((tmdb IS NOT NULL AND tmdb=?) OR (norm=? AND (year IS NULL OR ? IS NULL "
              "OR ABS(year-?)<=1) AND (tmdb IS NULL OR ? IS NULL OR tmdb=?)))" % (table, live()),
              r["tmdb"], r["norm"], r["year"], r["year"], r["tmdb"], r["tmdb"])
     ids = {x["id"] for x in rows} | {cid}
+    if r["work"]:  # every copy shown under the same Browse card
+        ids |= {x["id"] for x in q("SELECT id FROM %s INDEXED BY %s_work WHERE work=? AND %s"
+                                   % (table, table, live()), r["work"])}
     return sorted(ids, key=prio)
 
 
@@ -2461,7 +2467,7 @@ def _probe_run(kind, cid):
     try:
         out = subprocess.run([FFPROBE, "-v", "error", "-user_agent", p["user_agent"] or DEFAULT_UA,
                               "-rw_timeout", "20000000", "-show_entries",
-                              "format=duration,bit_rate,size:stream=codec_type,codec_name,width,height",
+                              "format=duration,bit_rate,size:format_tags=title:stream=codec_type,codec_name,width,height",
                               "-of", "json", stream_url(kind, cid, r["ext"])], capture_output=True, timeout=60)
         data = json.loads(out.stdout or b"{}")
     except subprocess.TimeoutExpired:
@@ -2479,9 +2485,11 @@ def _probe_run(kind, cid):
     f = data.get("format") or {}
     v = vids[0]
     br = to_int(f.get("bit_rate"))
-    ex("INSERT OR REPLACE INTO probes(id, width, height, vcodec, duration, bitrate, size, at, error) "
-       "VALUES(?,?,?,?,?,?,?,?,NULL)", cid, to_int(v.get("width")), to_int(v.get("height")), v.get("codec_name"),
-       to_int(f.get("duration")), br // 1000 if br else None, to_int(f.get("size")), time.time())
+    tags = {str(k).lower(): t for k, t in (f.get("tags") or {}).items()}
+    title = " ".join(str(tags.get("title") or "").split())[:200] or None
+    ex("INSERT OR REPLACE INTO probes(id, width, height, vcodec, duration, bitrate, size, at, error, title) "
+       "VALUES(?,?,?,?,?,?,?,?,NULL,?)", cid, to_int(v.get("width")), to_int(v.get("height")), v.get("codec_name"),
+       to_int(f.get("duration")), br // 1000 if br else None, to_int(f.get("size")), time.time(), title)
     PROBE_BG.pop((kind, cid), None)
     set_qual(table, cid)
     return media_view(q1("SELECT * FROM %s WHERE id=?" % table, cid))
@@ -4497,6 +4505,44 @@ def test_provider(pid):
     return out
 
 
+def folder_check(name):
+    """Can Sonarr or Radarr see VODgrab's download folders at the same path? VODgrab writes a small marker file
+    into each folder and asks the arr to list the folder. Never raises: each folder gets ok, missing, unknown
+    (the arr could not be asked) or error (VODgrab itself cannot write there)."""
+    arr = ARR(name)
+    out = []
+    for key, label in ((name, "Finished %s downloads" % arr.label),
+                       ("manual_movies" if name == "radarr" else "manual_tv", "Finished manual downloads")):
+        path = folder(key)
+        res = {"label": label, "folder": path, "state": "unknown", "detail": ""}
+        out.append(res)
+        marker = "vodgrab-folder-check-%s.txt" % secrets.token_hex(4)
+        fp = os.path.join(path, marker)
+        try:
+            os.makedirs(path, exist_ok=True)
+            with open(fp, "w") as f:
+                f.write("VODgrab folder check. Safe to delete.\n")
+        except OSError as e:
+            res.update(state="error", detail="VODgrab cannot write to this folder: %s" % e.strerror)
+            continue
+        try:
+            r = arr.call("GET", "/api/v3/filesystem", {"path": path.rstrip("/") + "/", "includeFiles": "true",
+                                                       "allowFoldersWithoutTrailingSlashes": "true"}, timeout=15)
+            files = r.get("files") if isinstance(r, dict) else None
+            if isinstance(files, list):
+                seen = any(isinstance(x, dict) and (x.get("name") == marker or str(x.get("path") or "").endswith(marker))
+                           for x in files)
+                res["state"] = "ok" if seen else "missing"
+        except Exception as e:
+            res["detail"] = mask(str(e))[:200]
+        finally:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+    return {"arr": arr.label, "folders": out}
+
+
 def test_target(name):
     arr = ARR(name)
     st = arr.get("/api/v3/system/status") or {}
@@ -4511,7 +4557,10 @@ def status_view():
     in_win, conc = window_state()
     last = q1("SELECT * FROM sync_runs WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1")
     return {"version": VERSION, "update": UPDATE["latest"] if UPDATE["latest"] and vtuple(UPDATE["latest"]) >
-            vtuple(VERSION) else "", "configured": bool(active_providers()), "paused": s["paused"], "banner": ENGINE.banner, "prov_error": bool(ENGINE.prov_errors), "arrs": {"radarr": RADARR.ok(), "sonarr": SONARR.ok()},
+            vtuple(VERSION) else "", "configured": bool(active_providers()),
+            # first-run setup wizard: only on an install with nothing set up yet
+            "wizard": not s.get("wizard_done") and not PROVIDERS and not RADARR.ok() and not SONARR.ok(),
+            "paused": s["paused"], "banner": ENGINE.banner, "prov_error": bool(ENGINE.prov_errors), "arrs": {"radarr": RADARR.ok(), "sonarr": SONARR.ok()},
             "ffprobe": bool(FFPROBE), "fts": FTS, "probe_open": bool(FFPROBE and s.get("probe_on_open")),
             "probe_series": s.get("probe_series_open", "season") if FFPROBE else "off",
             "window": {"enabled": s["schedule_enabled"] and bool(s["windows"]), "open": in_win, "concurrency": conc},
@@ -4971,7 +5020,7 @@ def collection_meta(cid):
 
 
 WORK_CARD_COLS = ("w.kind, w.rep, w.work, w.clean, w.norm, w.year, w.tmdb, w.icon, w.rating_n, w.first_seen, w.provs, "
-                  "w.np, w.qrank, w.mt, w.poster, w.pop, w.votes")
+                  "w.np, w.qrank, w.mt, w.poster, w.pop, w.votes, w.mtitle")
 
 
 def works_by_tmdb(kind, ids):
@@ -5666,25 +5715,34 @@ def rebuild_works():
     # catalog, so downloads and webhooks can keep writing meanwhile. Only the swap below locks the database.
     c.execute("DROP TABLE IF EXISTS temp.works_new")
     c.execute("CREATE TEMP TABLE works_new(%s)" % cols)
-    for kind, table in (("movie", "movies"), ("series", "series")):
-        ig = "COALESCE(t.igenres,'')" if kind == "movie" else "''"
-        qr = QRANK % "t.qual" if kind == "movie" else "9"
-        c.execute("""INSERT INTO temp.works_new(kind, work, rep, clean, norm, year, tmdb, icon, rating_n, first_seen, genres,
-            services, lists, langs, provs, adult, np, srch, qrank)
-            SELECT '%s', r.work, r.id, r.clean, r.norm, r.year, g.tmdb, r.icon, g.rating_n, g.first_seen, g.genres,
-                   g.services, g.lists, g.langs, g.provs, g.adult, g.np, g.srch, g.qrank
-            FROM (SELECT t.id, t.work, t.clean, t.norm, t.year, t.icon,
-                         ROW_NUMBER() OVER (PARTITION BY t.work ORDER BY %s, t.id) rn
-                  FROM %s t WHERE t.prov IN (%s)) r
-            JOIN (SELECT t.work, MAX(t.tmdb) tmdb, MAX(t.rating_n) rating_n, MIN(COALESCE(t.first_seen, 0)) first_seen,
-                         group_concat(COALESCE(t.genres,'') || %s, '') genres,
-                         group_concat(COALESCE(t.services,''), '') services,
-                         group_concat(COALESCE(t.lists,''), '') lists,
-                         group_concat(CASE WHEN t.lang IS NULL THEN '' ELSE '|' || t.lang || '|' END, '') langs,
-                         group_concat('|' || t.prov || '|', '') provs, MAX(COALESCE(t.adult,0)) adult,
-                         COUNT(*) np, group_concat(DISTINCT t.srch) srch, MIN(%s) qrank
-                  FROM %s t WHERE t.prov IN (%s) GROUP BY t.work) g ON g.work=r.work
-            WHERE r.rn=1""" % (kind, prank_sql(), table, ids, ig, qr, table, ids))
+    def build(kinds):
+        c.execute("DELETE FROM temp.works_new WHERE kind IN (%s)" % ",".join("'%s'" % k for k in kinds))
+        for kind, table in (("movie", "movies"), ("series", "series")):
+            if kind not in kinds:
+                continue
+            ig = "COALESCE(t.igenres,'')" if kind == "movie" else "''"
+            qr = QRANK % "t.qual" if kind == "movie" else "9"
+            c.execute("""INSERT INTO temp.works_new(kind, work, rep, clean, norm, year, tmdb, icon, rating_n, first_seen, genres,
+                services, lists, langs, provs, adult, np, srch, qrank)
+                SELECT '%s', r.work, r.id, r.clean, r.norm, r.year, g.tmdb, r.icon, g.rating_n, g.first_seen, g.genres,
+                       g.services, g.lists, g.langs, g.provs, g.adult, g.np, g.srch, g.qrank
+                FROM (SELECT t.id, t.work, t.clean, t.norm, t.year, t.icon,
+                             ROW_NUMBER() OVER (PARTITION BY t.work ORDER BY %s, t.id) rn
+                      FROM %s t WHERE t.prov IN (%s)) r
+                JOIN (SELECT t.work, MAX(t.tmdb) tmdb, MAX(t.rating_n) rating_n, MIN(COALESCE(t.first_seen, 0)) first_seen,
+                             group_concat(COALESCE(t.genres,'') || %s, '') genres,
+                             group_concat(COALESCE(t.services,''), '') services,
+                             group_concat(COALESCE(t.lists,''), '') lists,
+                             group_concat(CASE WHEN t.lang IS NULL THEN '' ELSE '|' || t.lang || '|' END, '') langs,
+                             group_concat('|' || t.prov || '|', '') provs, MAX(COALESCE(t.adult,0)) adult,
+                             COUNT(*) np, group_concat(DISTINCT t.srch) srch, MIN(%s) qrank
+                      FROM %s t WHERE t.prov IN (%s) GROUP BY t.work) g ON g.work=r.work
+                WHERE r.rn=1""" % (kind, prank_sql(), table, ids, ig, qr, table, ids))
+
+    build(("movie", "series"))
+    changed = unify_works(c)
+    if changed:
+        build(changed)
     c.execute("BEGIN")
     try:
         c.execute("DELETE FROM works")
@@ -5694,12 +5752,68 @@ def rebuild_works():
         if FTS:
             c.execute("DELETE FROM tri_works")
             c.execute("INSERT INTO tri_works(rowid, srch) SELECT wid, srch FROM works")
+        add_alt_titles(c)
         c.execute("COMMIT")
     except Exception:
         c.execute("ROLLBACK")
         raise
     finally:
         c.execute("DROP TABLE IF EXISTS temp.works_new")
+
+
+def unify_works(c):
+    """Give copies of one title the same work key, so Browse shows it once: copies matched to the same TMDB
+    entry, and a copy listed without a year when exactly one other title has the same name. Reads the scratch
+    table rebuild_works just filled; returns the kinds ("movie", "series") whose copies were regrouped."""
+    changed = []
+    for kind, table, arr in (("movie", "movies", "radarr"), ("series", "series", "sonarr")):
+        rows = c.execute("SELECT n.work, n.norm, n.year, COALESCE(n.tmdb, (SELECT NULLIF(mm.tmdb, 0) FROM md.meta_map mm "
+                         "WHERE mm.kind=n.kind AND mm.work=n.work)) mt FROM temp.works_new n WHERE n.kind=?",
+                         (kind,)).fetchall()
+        by_mt, by_norm, moves = collections.defaultdict(list), collections.defaultdict(list), {}
+        for r in rows:
+            if r["mt"]:
+                by_mt[r["mt"]].append(r["work"])
+            if r["norm"]:
+                by_norm[r["norm"]].append(r)
+        for mt, ws in by_mt.items():
+            if len(ws) > 1:
+                keep = "t%d" % mt if "t%d" % mt in ws else min(ws)
+                moves.update((w, keep) for w in ws if w != keep)
+        for rs in by_norm.values():
+            if len(rs) == 2:
+                bare = [r for r in rs if r["year"] is None and not r["mt"]]
+                dated = [r for r in rs if r["year"] is not None]
+                if len(bare) == 1 and len(dated) == 1:
+                    moves[bare[0]["work"]] = moves.get(dated[0]["work"], dated[0]["work"])
+        if not moves:
+            continue
+        c.execute("BEGIN")
+        try:
+            for old, new in moves.items():
+                c.execute("UPDATE %s SET work=? WHERE work=?" % table, (new, old))
+                c.execute("UPDATE OR IGNORE unlinks SET work=? WHERE arr=? AND work=?", (new, arr, old))
+                c.execute("DELETE FROM unlinks WHERE arr=? AND work=?", (arr, old))
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        changed.append(kind)
+        log("Merged %d duplicate %s listings into the titles they belong to" % (len(moves), kind))
+    return changed
+
+
+def add_alt_titles(c):
+    """Make titles findable by their TMDB name too, when the provider lists them under another one."""
+    for r in c.execute("SELECT wid, norm, srch, mtitle FROM works WHERE mtitle IS NOT NULL").fetchall():
+        if alt_title(r["mtitle"], r["norm"]):
+            extra = search_text(r["mtitle"])
+            if extra and extra not in (r["srch"] or ""):
+                srch = ((r["srch"] or "") + " " + extra).strip()
+                c.execute("UPDATE works SET srch=? WHERE wid=?", (srch, r["wid"]))
+                if FTS:
+                    c.execute("DELETE FROM tri_works WHERE rowid=?", (r["wid"],))
+                    c.execute("INSERT INTO tri_works(rowid, srch) VALUES(?,?)", (r["wid"], srch))
 
 
 def apply_meta(c=None, kind=None, tmdb=None):
@@ -5714,7 +5828,8 @@ def apply_meta(c=None, kind=None, tmdb=None):
         c.execute("UPDATE works SET mt=COALESCE(tmdb, (SELECT NULLIF(mm.tmdb, 0) FROM md.meta_map mm WHERE "
                   "mm.kind=works.kind AND mm.work=works.work))")
     c.execute("""UPDATE works SET cert=m.cert, runtime=m.runtime, pop=m.pop, votes=m.votes, mstatus=m.status,
-        watch=m.watch, olang=m.olang, poster=m.poster, genres=COALESCE(works.pgenres, '') || COALESCE(m.genres, ''),
+        watch=m.watch, olang=m.olang, poster=m.poster, mtitle=m.title,
+        genres=COALESCE(works.pgenres, '') || COALESCE(m.genres, ''),
         rating_n=CASE WHEN m.votes>=25 AND m.rating>0 THEN m.rating ELSE works.prating END
         FROM md.meta m WHERE m.kind=works.kind AND m.tmdb=works.mt AND m.data IS NOT NULL%s""" % one, args)
 
@@ -5860,6 +5975,27 @@ SORTS = {"new": "first_seen DESC, rep DESC", "title": "norm, year, rep", "title_
          "top": "topr DESC NULLS LAST, pop DESC NULLS LAST"}
 
 
+def flip_order(order):
+    """The same ORDER BY the other way round. Titles with no value (NULLS LAST) stay at the end."""
+    out = []
+    for term in order.split(","):
+        term = term.strip()
+        nulls = " NULLS LAST" if term.endswith(" NULLS LAST") else ""
+        term = term[:-len(nulls)] if nulls else term
+        term = term[:-5] if term.endswith(" DESC") else term + " DESC"
+        out.append(term + nulls)
+    return ", ".join(out)
+
+
+def sort_of(qs, default):
+    """(sort, reversed) from the request. The old 'title_desc' is title, reversed."""
+    sort = qs.get("sort") or default
+    rev = qs.get("rev") == "1"
+    if sort == "title_desc":
+        sort, rev = "title", not rev
+    return sort, rev
+
+
 def browse(qs):
     f = read_filters(qs)
     text = (qs.get("q") or "").strip()
@@ -5868,8 +6004,10 @@ def browse(qs):
         if time.time() - LIB["at"] > 3600 and not LIB["running"]:
             threading.Thread(target=refresh_library, daemon=True).start()
     if text:
-        return search(text, f, qs.get("sort") or "relevance", limit, offset, qs.get("marks") == "1")
-    return listing(f, qs.get("sort") or "new", limit, offset, qs.get("marks") == "1")
+        sort, rev = sort_of(qs, "relevance")
+        return search(text, f, sort, limit, offset, qs.get("marks") == "1", rev)
+    sort, rev = sort_of(qs, "new")
+    return listing(f, sort, limit, offset, qs.get("marks") == "1", rev)
 
 
 def row_source(f):
@@ -5882,7 +6020,7 @@ def row_source(f):
         out.append(("%s w LEFT JOIN works wm ON wm.kind='%s' AND wm.work=w.work" % (TABLES[kind], kind),
                     "'%s' AS kind, w.id AS rep, w.work, w.clean, w.norm, w.year, w.tmdb, "
                     "w.icon, w.rating_n, w.first_seen, '|' || w.prov || '|' AS provs, 1 AS np, %s AS qrank, wm.mt, "
-                    "wm.poster, wm.pop, wm.votes, CASE WHEN wm.votes>=100 THEN wm.rating_n END AS topr" % (kind, qr),
+                    "wm.poster, wm.pop, wm.votes, wm.mtitle, CASE WHEN wm.votes>=100 THEN wm.rating_n END AS topr" % (kind, qr),
                     kind))
     return out
 
@@ -5891,15 +6029,15 @@ LETTER_SQL = "CASE WHEN substr(w.norm, 1, 1) BETWEEN 'a' AND 'z' THEN upper(subs
 DECADE_SQL = "CASE WHEN w.year IS NULL THEN -1 ELSE (w.year / 10) * 10 END"
 
 
-def jump_marks(groups, sort):
-    """Letters (title sorts) or decades (year sort) in list order, each with its count and the offset where it
+def jump_marks(groups, sort, rev=False):
+    """Letters (title sort) or decades (year sort) in list order, each with its count and the offset where it
     starts, for the jump bar."""
-    if sort in ("title", "title_desc"):
+    if sort == "title":
         order = ["#"] + [chr(c) for c in range(65, 91)]
-        if sort == "title_desc":
+        if rev:
             order.reverse()
     else:
-        order = sorted((g for g in groups if g != -1), reverse=True) + [-1]
+        order = sorted((g for g in groups if g != -1), reverse=not rev) + [-1]
     out, off = [], 0
     for g in order:
         n = groups.get(g, 0)
@@ -5929,17 +6067,19 @@ def counted(f, sql, args):
     return _facet_cache[key]
 
 
-def listing(f, sort, limit, offset, marks=False):
+def listing(f, sort, limit, offset, marks=False, rev=False):
     parts, args, total = [], [], 0
     for frm, cols, kind in row_source(f):
         where, a = filter_sql(f, kind, f["merge"])
         parts.append("SELECT %s FROM %s WHERE %s" % (cols, frm, " AND ".join(where)))
         args += a
         total += counted(f, "SELECT COUNT(*) c FROM %s WHERE %s" % (frm, " AND ".join(where)), a)[0]["c"]
-    sql = "SELECT * FROM (%s) ORDER BY %s LIMIT ? OFFSET ?" % (" UNION ALL ".join(parts), SORTS.get(sort, SORTS["new"]))
+    order = SORTS.get(sort, SORTS["new"])
+    sql = "SELECT * FROM (%s) ORDER BY %s LIMIT ? OFFSET ?" % (" UNION ALL ".join(parts),
+                                                               flip_order(order) if rev else order)
     rows = q(sql, *(args + [limit, offset]))
     out = {"total": total, "items": [card(r) for r in rows], "suggest": [], "fuzzy": False}
-    if marks and sort in ("title", "title_desc", "year"):
+    if marks and sort in ("title", "year"):
         expr = LETTER_SQL if sort != "year" else DECADE_SQL
         groups = {}
         for frm, cols, kind in row_source(f):
@@ -5947,7 +6087,7 @@ def listing(f, sort, limit, offset, marks=False):
             for r in counted(f, "SELECT %s g, COUNT(*) n FROM %s WHERE %s GROUP BY g"
                              % (expr, frm, " AND ".join(where)), a):
                 groups[r["g"]] = groups.get(r["g"], 0) + r["n"]
-        out["marks"] = jump_marks(groups, sort)
+        out["marks"] = jump_marks(groups, sort, rev)
     return out
 
 
@@ -6054,7 +6194,7 @@ def rank(r, pq, fuzzy_ratio=None):
     return base + (r["rating_n"] or 0) * 3 - len(n) * 0.4
 
 
-def search(text, f, sort, limit, offset, marks=False):
+def search(text, f, sort, limit, offset, marks=False, rev=False):
     pq = parse_query(text)
     scored = {}
     rows, capped = candidates(pq, f)
@@ -6071,18 +6211,21 @@ def search(text, f, sort, limit, offset, marks=False):
             suggest = list(dict.fromkeys(v[1]["clean"] for v in sorted(scored.values(), key=lambda v: -v[0])[:3]))
     vals = list(scored.values())
     keyf = {"title": lambda v: (v[1]["norm"], v[1]["year"] or 0),
-            "title_desc": lambda v: (v[1]["norm"], v[1]["year"] or 0),
             "year": lambda v: (v[1]["year"] is None, -(v[1]["year"] or 0)),
             "rating": lambda v: -(v[1]["rating_n"] or 0), "new": lambda v: -(v[1]["first_seen"] or 0),
             "quality": lambda v: (v[1]["qrank"], -(v[1]["rating_n"] or 0)),
             "popular": lambda v: -(v[1]["pop"] or 0),
             "top": lambda v: (v[1]["topr"] is None, -(v[1]["topr"] or 0), -(v[1]["pop"] or 0))}.get(sort, lambda v: -v[0])
-    vals.sort(key=keyf, reverse=sort == "title_desc")
+    vals.sort(key=keyf)
+    if rev:  # the other way round, with titles that have no year (or no rating) still at the end
+        col = {"year": "year", "top": "topr"}.get(sort)
+        tail = [v for v in vals if col and v[1][col] is None]
+        vals = [v for v in reversed(vals) if not (col and v[1][col] is None)] + tail
     out_marks = None
-    if marks and sort in ("title", "title_desc", "year"):
+    if marks and sort in ("title", "year"):
         groups = collections.Counter(letter_of(r["norm"]) if sort != "year" else
                                      (-1 if r["year"] is None else r["year"] // 10 * 10) for _, r in vals)
-        out_marks = jump_marks(groups, sort)
+        out_marks = jump_marks(groups, sort, rev)
     return {"total": len(vals), "capped": capped, "items": [card(r) for _, r in vals[offset:offset + limit]],
             "marks": out_marks,
             "suggest": suggest, "fuzzy": fuzzy,
@@ -6107,7 +6250,18 @@ def card(r):
     return {"kind": kind, "id": r["rep"], "clean": r["clean"], "year": r["year"], "icon": r["icon"],
             "rating": r["rating_n"], "providers": [pname(p) for p in provs], "nprov": len(provs),
             "quality": QUALS[qr] if qr < len(QUALS) else None, "lib": status, "wanted": wanted,
-            "poster": r["poster"] if "poster" in keys else None, "l": letter_of(r["norm"])}
+            "poster": r["poster"] if "poster" in keys else None, "l": letter_of(r["norm"]),
+            "title": alt_title(r["mtitle"] if "mtitle" in keys else None, r["norm"])}
+
+
+def alt_title(mtitle, norm_):
+    """The TMDB title, when the provider lists the title under a clearly different name (another language)."""
+    if not mtitle:
+        return None
+    a = norm(mtitle)
+    if not a or a == norm_ or a in (norm_ or "") or (norm_ or "") in a:
+        return None
+    return mtitle if difflib.SequenceMatcher(None, a, norm_ or "").ratio() < 0.6 else None
 
 
 _facet_cache = {}
@@ -6849,6 +7003,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, setup_arr(parts[1], data.get("external_url")))
         if a == "arrmeta" and len(parts) > 1:
             return self.send(200, arr_meta(parts[1]))
+        if a == "foldercheck" and len(parts) > 1 and parts[1] in ("sonarr", "radarr"):
+            return self.send(200, folder_check(parts[1]))
         if a == "meta":
             sub = parts[1] if len(parts) > 1 else ""
             if sub == "fill" and method == "POST":
@@ -7516,6 +7672,18 @@ input[type=checkbox]{width:auto}
 .st.cancelled,.st.retried{background:var(--panel2);color:var(--dim)}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;z-index:20;overflow:auto;padding:30px 12px}
 .modal.on{display:flex}
+#wiz{position:fixed;inset:0;background:rgba(8,9,12,.92);z-index:40;display:none;overflow:auto;padding:24px 12px}
+#wiz.on{display:block}
+.wz{max-width:760px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+.wz h2{margin:0 0 4px;font-size:20px}.wz h3{margin:18px 0 8px;font-size:15px}.wz p{color:var(--dim);margin:6px 0 12px;line-height:1.5}
+.wz .steps{display:flex;gap:6px;margin:0 0 16px;flex-wrap:wrap}
+.wz .steps span{font-size:12px;padding:3px 9px;border-radius:99px;background:var(--panel2);color:var(--dim)}
+.wz .steps span.on{background:var(--acc);color:#111;font-weight:600}.wz .steps span.done{color:var(--ok)}
+.wz .nav{display:flex;gap:8px;margin-top:20px;align-items:center;flex-wrap:wrap}.wz .nav .sp{flex:1}
+.wz .res{margin-top:10px;font-size:13px;line-height:1.5}
+.wz .res div{padding:2px 0}.wz .res .ok{color:var(--ok)}.wz .res .bad{color:var(--bad)}.wz .res .warn{color:var(--acc)}.wz .res .wait{color:var(--dim)}
+.wz .box{border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:12px;background:var(--panel2)}
+.wz .box input{background:var(--panel)}
 .sheet{background:var(--panel);border:1px solid var(--line);border-radius:14px;max-width:900px;width:100%;overflow:hidden}
 .sheet .head{display:flex;gap:18px;padding:18px}
 .sheet .head .poster{width:160px;flex:none;border-radius:8px}
@@ -7550,6 +7718,7 @@ section.set h3{margin:0 0 10px;font-size:15px}
 .q.k2160p{background:#3a2a10;color:#f0c35a}.q.k1080p{background:#16352a;color:var(--ok)}.q.k720p{background:#1c2c45;color:#9fc0f5}.q.k480p,.q.unk{background:var(--panel2);color:var(--dim)}
 .srcs{display:flex;flex-direction:column;gap:6px;margin:12px 0}
 .src{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel2);border-radius:8px;padding:8px 10px}
+.src .mi .fn{margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:560px;opacity:.85}
 .src .pn{font-weight:600;min-width:90px}.src .mi{flex:1;min-width:160px;color:var(--dim);font-size:12px}
 .fpanel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;margin-bottom:12px}
 .fg{margin-bottom:10px}.fgt{font-size:12px;color:var(--dim);margin-bottom:6px;font-weight:600}
@@ -7673,6 +7842,7 @@ body.hasrail main{padding-right:52px}
 <main id="main"></main>
 <div class="modal" id="modal"><div class="sheet" id="sheet"></div></div>
 <div class="toast" id="toast"></div>
+<div id="wiz"></div>
 <nav class="rail" id="rail" hidden></nav><div class="jbub" id="jbub"></div>
 <script>
 const $=(s,e=document)=>e.querySelector(s), $$=(s,e=document)=>[...e.querySelectorAll(s)];
@@ -7687,13 +7857,15 @@ const when=t=>{const d=new Date(t*1000),n=new Date();const hm=d.toLocaleTimeStri
 const STL={queued:"Queued",retry_wait:"Retrying",downloading:"Downloading",verifying:"Verifying",importing:"Importing",completed:"Downloaded",imported:"Imported",failed:"Failed",import_failed:"Import failed",cancelled:"Cancelled",retried:"Sent to arr"};
 const dur=s=>{if(!s)return"";const h=Math.floor(s/3600),m=Math.round(s%3600/60);return h?`${h}h ${m}m`:`${m}m`};
 const qb=m=>m&&m.known?`<span class="q k${m.quality}">${m.quality}</span>`:`<span class="q unk" title="Provider did not report quality">?</span>`;
+const fnLine=(name,ft)=>{const a=[];if(name)a.push("Listed as: "+name);if(ft&&ft!=name)a.push("In the file: "+ft);return a.length?`<div class="fn" title="${esc(a.join("\n"))}">${esc(a.join(" · "))}</div>`:""};
+const miSet=(el,q)=>{el.innerHTML=esc(qinfo(q))+(el.dataset.ext?" · "+esc(el.dataset.ext):"")+fnLine(el.dataset.name,q.file_title)};
 const qinfo=m=>m&&m.known?[m.width&&m.height?`${m.width}×${m.height}`:"",m.codec,dur(m.duration),m.size?"about "+fb(m.size):"",m.source=="checked"?"checked":"reported by provider"].filter(Boolean).join(" · "):"Quality not reported";
 async function probeIt(kind,id,btn){btn.disabled=true;btn.textContent="Checking…";try{const r=await api("probe",{kind,id});return r}catch(e){toast(e.message,1);btn.disabled=false;btn.textContent="Check quality";return null}}
 const st=s=>`<span class="st ${esc(s)}">${esc(STL[s]||s)}</span>`;
 
 let tab="browse", timer=null, status={};
 const FKEYS=["service","genre","list","lang","prov","quality","lib","cert","runtime","olang","watch","status"];
-const DEF={type:"movie",q:"",sort:"",year_from:"",year_to:"",rating:"",new:"",merge:"1",view:"grid"};
+const DEF={type:"movie",q:"",sort:"",rev:"",year_from:"",year_to:"",rating:"",new:"",merge:"1",view:"grid"};
 let F=null, FAC=null, SEL=new Map(), selMode=false, loading=false, B={offset:0,start:0,total:0,seq:0};
 
 function readHash(){const h=location.hash.replace(/^#/,"");const [t,qs]=h.split("?");
@@ -7739,7 +7911,7 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden)refreshSta
 /* ---------------- browse */
 const LIBL={missing:"Not in library",in_arr:"In library, no file",has_file:"In library with file",vodgrab:"Downloaded by VODgrab",wanted:"Wanted by Sonarr or Radarr"};
 const LIBB={in_arr:["In "+"arr","lb1"],has_file:["Have it","lb2"],vodgrab:["Downloaded","lb2"]};
-const SORTL={relevance:"Best match",new:"New arrivals",popular:"Popular",top:"Top rated",title:"Title A to Z",title_desc:"Title Z to A",year:"Year",rating:"Rating",quality:"Quality"};
+const SORTL={relevance:"Best match",new:"New arrivals",popular:"Popular",top:"Top rated",title:"Title",year:"Year",rating:"Rating",quality:"Quality"};
 const RUNL={movie:{short:"Under 1h 30m",medium:"1h 30m to 2h",long:"2h to 2h 30m",epic:"Over 2h 30m"},series:{short:"Episodes under 30m",medium:"Episodes 30m to 50m",long:"Episodes over 50m"},all:{short:"Short",medium:"Medium",long:"Long",epic:"Very long"}};
 const runL=v=>(RUNL[F&&F.type]||RUNL.all)[v]||v;
 function activeCount(){return FKEYS.reduce((n,k)=>n+F[k].length,0)+["year_from","year_to","rating","new"].filter(k=>F[k]).length}
@@ -7753,7 +7925,7 @@ async function renderBrowse(){
   m.innerHTML=`<div class="tools">
     <div class="seg" id="types"><button data-k="movie">Movies</button><button data-k="series">Series</button><button data-k="all">Both</button></div>
     <input type="search" id="q" placeholder="Search titles   ( / )" value="${esc(F.q)}" autocomplete="off">
-    <select id="sort"></select>
+    <select id="sort"></select><button class="btn" id="sdir"></button>
     <button class="btn" id="tipbtn" title="Search tips">?</button>
     <button class="btn" id="fbtn">Filters<span class="n" id="fcount" hidden></span></button>
     <div class="seg" id="views"><button data-v="grid" title="Grid">▦</button><button data-v="list" title="List">☰</button></div>
@@ -7789,10 +7961,16 @@ async function renderBrowse(){
   try{FAC=await api("facets?type="+F.type)}catch(e){FAC=null}
   drawChips();load(true)}
 
-function drawSort(){const s=$("#sort");if(!s)return;const opts=F.q?["relevance","new","popular","top","title","title_desc","year","rating","quality"]:["new","popular","top","title","title_desc","year","rating","quality"];
+function drawSort(){const s=$("#sort");if(!s)return;const opts=F.q?["relevance","new","popular","top","title","year","rating","quality"]:["new","popular","top","title","year","rating","quality"];
+  if(F.sort=="title_desc"){F.sort="title";F.rev=F.rev?"":"1"}
   const cur=F.sort&&opts.includes(F.sort)?F.sort:opts[0];
+  // what the normal and the reversed direction mean for each sort
+  const DIRL={relevance:["Best match first","Weakest match first"],new:["Newest first","Oldest first"],popular:["Most popular first","Least popular first"],top:["Highest rated first","Lowest rated first"],title:["A to Z","Z to A"],year:["Newest first","Oldest first"],rating:["Highest first","Lowest first"],quality:["Best first","Lowest first"]};
+  const up=cur=="title"?!F.rev:!!F.rev,d=$("#sdir");
+  if(d){d.textContent=up?"↑":"↓";d.title=DIRL[cur][F.rev?1:0]+" (click to reverse)";d.setAttribute("aria-label",d.title);
+    d.onclick=()=>{F.rev=F.rev?"":"1";drawSort();setF("rev",F.rev)}}
   s.innerHTML=opts.filter(o=>o!="quality"||F.type!="series").map(o=>`<option value="${o}">${SORTL[o]}</option>`).join("");s.value=cur;
-  s.onchange=e=>setF("sort",e.target.value)}
+  s.onchange=e=>{F.rev="";F.sort=e.target.value;drawSort();setF("sort",F.sort)}}
 
 function chipGroup(k,title,items,label){if(!items||!items.length)return"";
   const many=items.length>14,open=$("#panel")&&$("#panel").dataset["open"+k];
@@ -7836,11 +8014,11 @@ function drawChips(){const c=$("#chips");if(!c)return;const fa=FAC||{};const out
   const n=activeCount(),fc=$("#fcount");if(fc){fc.hidden=!n;fc.textContent=n}}
 
 function params(){const p=new URLSearchParams();p.set("type",F.type);if(F.q)p.set("q",F.q);
-  const opts=F.q?"relevance":"new";p.set("sort",F.sort||opts);if(F.merge=="0")p.set("merge","0");
+  const opts=F.q?"relevance":"new";p.set("sort",F.sort||opts);if(F.rev)p.set("rev","1");if(F.merge=="0")p.set("merge","0");
   FKEYS.forEach(k=>{if(F[k].length)p.set(k,F[k].join(","))});["year_from","year_to","rating","new"].forEach(k=>{if(F[k])p.set(k,F[k])});
   p.set("offset",B.offset);p.set("limit",60);return p}
 const curSort=()=>F.sort||(F.q?"relevance":"new");
-const JUMPS=["title","title_desc","year"];
+const JUMPS=["title","year"];
 async function load(reset,from){const box=$("#results");if(!box)return;
   const jump=from!=null;
   if(reset){B.offset=jump?from:0;B.start=B.offset;B.total=0}
@@ -7902,7 +8080,7 @@ function railMark(){const r=$("#rail");if(!r||r.hidden)return;let cur=null;
 let scT=null,lastMark=null;
 window.addEventListener("scroll",()=>{if(scT)return;scT=requestAnimationFrame(()=>{scT=null;const c=railMark();if(c&&c!==lastMark&&lastMark!==null&&!$("#rail").hidden)bubble(c);lastMark=c})},{passive:true});
 document.addEventListener("keydown",e=>{if(tab!="browse"||e.ctrlKey||e.metaKey||e.altKey||!/^[a-z]$/i.test(e.key)||/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)||$("#modal").classList.contains("on"))return;
-  const l=e.key.toUpperCase();if(curSort()=="title"||curSort()=="title_desc"){jumpTo(l);return}
+  const l=e.key.toUpperCase();if(curSort()=="title"){jumpTo(l);return}
   F.sort="title";writeHash(true);drawSort();PENDING=l;load(true)});
 const ARRN=k=>k=="movie"?"Radarr":"Sonarr";
 const canAdd=i=>i.lib=="missing"&&status.arrs&&status.arrs[i.kind=="movie"?"radarr":"sonarr"];
@@ -7916,9 +8094,9 @@ function badges(i){return `${i.wanted?`<span class="lb lb3">Wanted</span>`:""}${
 function imgFail(el){const a=el.dataset.alt;if(a){el.dataset.alt="";el.src=a}else el.remove()}
 function posterImg(i){const a=i.poster||i.icon,b=i.poster&&i.icon&&i.icon!=i.poster?i.icon:"";return a?`<img loading="lazy" alt="" src="${esc(a)}" data-alt="${esc(b)}" onerror="imgFail(this)">`:""}
 function cardHtml(i){return `<div class="card${selMode?" selmode":""}${SEL.has(i.id)?" sel":""}" data-cid="${i.id}" data-kind="${i.kind}" data-t="${esc(i.clean)}" data-l="${esc(i.l||"")}" data-y="${i.year||""}">
-  <div class="poster"><span class="pt">${esc(i.clean)}</span>${posterImg(i)}<div class="bdg">${badges(i)}</div><div class="tick">✓</div>${canAdd(i)?`<button class="addb" data-add title="Add to ${ARRN(i.kind)}">+ ${ARRN(i.kind)}</button>`:""}</div>
-  <div class="t" title="${esc(i.clean)}">${esc(i.clean)}<div class="y">${i.year||""}${F.type=="all"?` · ${i.kind=="movie"?"Movie":"Series"}`:""}${i.rating?` · ★ ${i.rating}`:""}${i.nprov>1?`<span class="ptag" title="${esc(i.providers.join(", "))}">${i.nprov} providers</span>`:(FAC&&FAC.providers&&FAC.providers.length>1?`<span class="ptag">${esc(i.providers[0])}</span>`:"")}</div></div></div>`}
-function rowHtml(i){return `<tr class="lrow${selMode?" selmode":""}${SEL.has(i.id)?" sel":""}" data-cid="${i.id}" data-kind="${i.kind}" data-t="${esc(i.clean)}" data-l="${esc(i.l||"")}" data-y="${i.year||""}"><td class="tk">✓</td><td class="lt">${esc(i.clean)}</td><td>${i.year||""}</td><td>${i.kind=="movie"?"Movie":"Series"}</td>
+  <div class="poster"><span class="pt">${esc(i.title||i.clean)}</span>${posterImg(i)}<div class="bdg">${badges(i)}</div><div class="tick">✓</div>${canAdd(i)?`<button class="addb" data-add title="Add to ${ARRN(i.kind)}">+ ${ARRN(i.kind)}</button>`:""}</div>
+  <div class="t" title="${esc(i.title?i.title+" (listed as "+i.clean+")":i.clean)}">${esc(i.title||i.clean)}<div class="y">${i.year||""}${F.type=="all"?` · ${i.kind=="movie"?"Movie":"Series"}`:""}${i.rating?` · ★ ${i.rating}`:""}${i.nprov>1?`<span class="ptag" title="${esc(i.providers.join(", "))}">${i.nprov} providers</span>`:(FAC&&FAC.providers&&FAC.providers.length>1?`<span class="ptag">${esc(i.providers[0])}</span>`:"")}</div></div></div>`}
+function rowHtml(i){return `<tr class="lrow${selMode?" selmode":""}${SEL.has(i.id)?" sel":""}" data-cid="${i.id}" data-kind="${i.kind}" data-t="${esc(i.clean)}" data-l="${esc(i.l||"")}" data-y="${i.year||""}"><td class="tk">✓</td><td class="lt">${esc(i.title||i.clean)}${i.title?` <span class="muted" style="font-size:12px">listed as ${esc(i.clean)}</span>`:""}</td><td>${i.year||""}</td><td>${i.kind=="movie"?"Movie":"Series"}</td>
   <td>${esc(i.providers.join(", "))}</td><td>${i.quality?`<span class="q k${i.quality}">${i.quality=="2160p"?"4K":i.quality}</span>`:`<span class="muted">?</span>`}</td><td>${i.rating?"★ "+i.rating:""}</td><td>${i.wanted?`<span class="lb lb3">Wanted</span> `:""}${LIBL[i.lib]&&i.lib!="missing"?LIBL[i.lib]:`<span class="muted">No</span>`}</td>
   <td style="white-space:nowrap">${canAdd(i)?`<button class="btn s" data-add>Add to ${ARRN(i.kind)}</button> `:""}<button class="btn s" data-dl1>Download</button></td></tr>`}
 function toggleSel(el,it){SEL.has(it.id)?SEL.delete(it.id):SEL.set(it.id,it);el.classList.toggle("sel",SEL.has(it.id));drawBulk()}
@@ -7962,7 +8140,9 @@ function ratingsHtml(m,prov){const o=m.omdb&&!m.omdb.error?m.omdb:null,out=[];
   if(o&&o.metacritic)out.push(`<span class="rb" title="Metacritic"><span class="ic mc">MC</span><b>${esc(o.metacritic)}</b></span>`);
   if(!out.length&&prov)out.push(`<span class="rb" title="Rating from the provider"><b>★ ${esc(prov)}</b></span>`);
   return out.length?`<div class="ratings">${out.join("")}</div>`:""}
+const nrm=x=>(x||"").normalize("NFKD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
 function heroHtml(kind,t,m,base,acts){
+  const a=nrm(m.title),b=nrm(t),alt=!!(a&&b&&a!=b&&!a.includes(b)&&!b.includes(a));
   const pst=m.poster||base.poster,yr=base.year||(m.date||"").slice(0,4);
   const facts=[m.cert?`<span class="cert" title="Age rating${m.cert_region?" ("+esc(m.cert_region)+")":""}">${esc(m.cert)}</span>`:"",
     kind=="movie"&&m.date?esc(fmtDate(m.date)):"",m.runtime?esc(dur(m.runtime*60))+(kind=="series"?" episodes":""):"",
@@ -7972,8 +8152,8 @@ function heroHtml(kind,t,m,base,acts){
   return `<div class="hero" ${m.backdrop?`style="background-image:url('${esc(m.backdrop)}')"`:""}><div class="hero-in">
     <div class="pst" ${pst?`style="background-image:url('${esc(pst)}')"`:""}></div>
     <div style="flex:1;min-width:0"><button class="x">×</button>
-      <h2>${esc(t)} ${yr?`<span class="muted" style="font-weight:400">(${esc(yr)})</span>`:""}</h2>
-      ${m.otitle?`<div class="ot">${esc(m.otitle)}</div>`:""}${m.tagline?`<div class="tagl">${esc(m.tagline)}</div>`:""}
+      <h2>${esc(alt?m.title:t)} ${yr?`<span class="muted" style="font-weight:400">(${esc(yr)})</span>`:""}</h2>
+      ${alt?`<div class="ot">Listed by your provider as ${esc(t)}</div>`:m.otitle?`<div class="ot">${esc(m.otitle)}</div>`:""}${m.tagline?`<div class="tagl">${esc(m.tagline)}</div>`:""}
       ${facts.length?`<div class="facts">${facts.join('<span class="dot">•</span>')}</div>`:""}
       ${gen?`<div class="kws">${gen}</div>`:""}
       ${ratingsHtml(m,base.rating)}
@@ -8034,7 +8214,7 @@ async function openMovie(id){
     ${plot?`<p class="ovw">${esc(plot)}</p>`:""}${!m.has&&x.director?`<div class="muted" style="margin-top:8px">Director: ${esc(x.director)}${x.cast?" · Cast: "+esc(x.cast):""}</div>`:""}
     ${noMeta(m)}${x.info_error?`<div class="muted">Provider details unavailable: ${esc(x.info_error)}</div>`:""}
     <div class="sec"><h4>Download</h4><div class="srcs" style="margin:0">${x.sources.map(s=>`<div class="src" data-sid="${s.id}"><span class="pn">${esc(s.provider)}</span>${qb(s)}
-      <span class="mi" title="${esc(s.name)}">${esc(qinfo(s))} · ${esc(s.ext)}</span>
+      <span class="mi" data-name="${esc(s.name)}" data-ext="${esc(s.ext)}">${esc(qinfo(s))} · ${esc(s.ext)}${fnLine(s.name,s.file_title)}</span>
       ${s.dp_copies&&s.dp_copies.length?`<select data-dpc title="Which provider Dispatcharr downloads this from" style="max-width:260px"><option value="">Dispatcharr picks (${s.dp_copies.length} cop${s.dp_copies.length==1?"y":"ies"})</option>${s.dp_copies.map((c,i)=>`<option value="${i}">${esc(c.account)}${c.quality?" · "+esc(c.quality):""}${c.ext?" · "+esc(c.ext):""}</option>`).join("")}</select>`:s.dp_error?`<span class="muted" title="${esc(s.dp_error)}">Dispatcharr's copies unavailable</span>`:""}
       ${s.known?"":`<button class="btn s" data-chk>Check quality</button>`}<button class="btn s" data-play>▶ Play</button><button class="btn s p" data-dl>Download</button></div>`).join("")}</div>
       <div class="tools" style="margin:8px 0 0">${nowBox}<span class="muted" style="font-size:12px">${x.sources.length>1?"Starts with the provider you pick and falls back to the others. ":""}Check quality reads the file header for a few seconds.</span></div></div>
@@ -8046,12 +8226,12 @@ async function openMovie(id){
     $("[data-dl]",r).onclick=async e=>{e.target.disabled=true;const src=x.sources.find(y=>y.id==sid)||{},sel=$("[data-dpc]",r);
       await dl({kind:"movie",id:sid,now:$("#now").checked,dp:sel&&sel.value!==""?src.dp_copies[+sel.value]:null});closeModal()};
     $("[data-play]",r).onclick=()=>{const s=x.sources.find(y=>y.id==sid)||{};play("movie",sid,x.clean+" from "+(s.provider||""),[s.quality,s.codec,s.ext].filter(Boolean).join(" · "))};
-    const c=$("[data-chk]",r);if(c)c.onclick=async()=>{const q=await probeIt("movie",sid,c);if(q){c.remove();$(".q",r).outerHTML=qb(q);$(".mi",r).textContent=qinfo(q)}}});
+    const c=$("[data-chk]",r);if(c)c.onclick=async()=>{const q=await probeIt("movie",sid,c);if(q){c.remove();$(".q",r).outerHTML=qb(q);miSet($(".mi",r),q)}}});
   const todo=status.probe_open?x.sources.filter(s=>s.source!="checked"):[];
   if(todo.length){todo.forEach(s=>{const r=$(`.src[data-sid="${s.id}"]`);if(!r)return;$(".q",r).outerHTML=`<span class="q unk checking" title="Checking quality">…</span>`;const c=$("[data-chk]",r);if(c)c.hidden=true});
     let res={};try{res=await api("probe/open",{items:todo.map(s=>["movie",s.id])})}catch(e){}
     todo.forEach(s=>{const r=$(`.src[data-sid="${s.id}"]`);if(!r)return;const q=res[s.id]||s;const c=$("[data-chk]",r);
-      $(".q",r).outerHTML=qb(q);$(".mi",r).textContent=q.missing?"Missing on the provider: "+q.missing:qinfo(q);if(q.missing)$(".mi",r).style.color="var(--bad)";
+      $(".q",r).outerHTML=qb(q);if(q.missing){$(".mi",r).textContent="Missing on the provider: "+q.missing;$(".mi",r).style.color="var(--bad)"}else miSet($(".mi",r),q);
       if(c){if(q.known&&!q.pending)c.remove();else c.hidden=false}})}}
 async function openSeries(id){
   modal(`<div class="head"><div>Loading episodes…</div><button class="x">×</button></div>`);
@@ -8063,7 +8243,7 @@ async function openSeries(id){
     return `<div class="ep2${e.missing?" na":""}"><div class="still" ${e.still?`style="background-image:url('${esc(e.still)}')"`:""}>${e.still?"":n}</div>
       <div class="eb"><div class="eh"><span class="en">${n}</span><span class="et">${esc(t)}</span>${e.wanted?`<span class="lb lb3">Wanted</span>`:""}${meta?`<span class="em">${esc(meta)}</span>`:""}</div>
       ${e.overview?`<div class="eo" title="Click to expand">${esc(e.overview)}</div>`:""}
-      <div class="ea">${e.missing?`<span class="muted" style="font-size:12px">Not on your providers</span>`:`<span title="${esc(qinfo(e.media))}">${e.checking?`<span class="q unk checking" title="Checking quality">…</span>`:qb(e.media)}</span>${e.media.missing?`<span style="color:var(--bad);font-size:12px">Missing on the provider</span>`:""}${e.media.known?`<span class="em">${esc([e.media.codec,dur(e.media.duration),e.media.size?fb(e.media.size):""].filter(Boolean).join(" · "))}</span>`:""}${e.job?st(e.job):""}
+      <div class="ea">${e.missing?`<span class="muted" style="font-size:12px">Not on your providers</span>`:`<span title="${esc(qinfo(e.media)+(e.media.file_title?" · In the file: "+e.media.file_title:""))}">${e.checking?`<span class="q unk checking" title="Checking quality">…</span>`:qb(e.media)}</span>${e.media.missing?`<span style="color:var(--bad);font-size:12px">Missing on the provider</span>`:""}${e.media.known?`<span class="em">${esc([e.media.codec,dur(e.media.duration),e.media.size?fb(e.media.size):""].filter(Boolean).join(" · "))}</span>`:""}${e.job?st(e.job):""}
         ${e.media.known||e.checking?"":`<button class="btn s" data-c="${e.id}">Check quality</button>`}<button class="btn s" data-pl="${e.id}">▶ Play</button><button class="btn s p" data-e="${e.id}">Download</button>`}</div></div></div>`};
   const probed=new Set();
   const checkSeason=async se=>{const how=status.probe_series||"off";if(how=="off"||probed.has(se.season))return;probed.add(se.season);
@@ -8337,7 +8517,7 @@ async function renderSettings(){
     ${fld("sync_interval_hours","Sync interval","select","Runs start at midnight",SV.intervals.map(h=>[h,ivLabel(h)]))}
     ${fld("grace_cycles","Keep missing titles for this many syncs","number","When a provider stops listing a title, it stays this many more syncs before it is removed")}
     ${fld("missing_recheck_hours","Check missing titles again","select","An extra sync this long after titles go missing, re-reading only the providers that lost them, so a title gone twice is removed sooner. Only runs if it comes before the next scheduled sync.",[[0,"Off (next scheduled sync)"],[1,"After 1 hour"],[2,"After 2 hours"],[4,"After 4 hours"],[6,"After 6 hours"]])}</div>
-    <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button><a class="btn" id="lastChg" download hidden>Download last sync changes</a></div><div id="runs"></div></section>
+    <div class="tools" style="margin-top:12px"><button class="btn" id="syncBtn">Sync now</button><button class="btn" id="wizBtn">Run setup wizard</button><a class="btn" id="lastChg" download hidden>Download last sync changes</a></div><div id="runs"></div></section>
   <section class="set"><h3>Quality checks</h3>
     <div class="hint muted" style="margin-bottom:10px">When Sonarr or Radarr search, VODgrab reads the header of every copy it is about to offer so the quality it reports is the real one. Copies with different quality become separate releases, and missing files are left out. Each check uses one provider connection for a few seconds and is remembered.</div>
     <div class="fields">
@@ -8420,6 +8600,7 @@ async function renderSettings(){
   const out=(id,t)=>{const o=$("#o_"+id);o.style.display="block";o.textContent=t};
   $$("[data-test]").forEach(b=>b.onclick=async()=>{const k=b.dataset.test;out(k,"Testing…");try{await save(true);const r=await api("test/"+k,{});out(k,JSON.stringify(r,null,2))}catch(e){out(k,e.message)}});
   $$("[data-setup]").forEach(b=>b.onclick=async()=>{const k=b.dataset.setup;out(k,"Setting up…");try{await save(true);const r=await api("setup/"+k,{external_url:location.origin});out(k,r.message)}catch(e){out(k,e.message)}});
+  $("#wizBtn").onclick=()=>openWizard();
   $("#syncBtn").onclick=async()=>{const r=await api("sync",{});toast(r.ok?"Sync started":r.message);setTimeout(()=>{refreshStatus();runs()},1500)};
   $("#libBtn").onclick=async()=>{await api("library",{});toast("Library status is refreshing")};
   $("#newKey").onclick=async()=>{if(!confirm("Replace the API key? Sonarr and Radarr need setup again afterwards."))return;await api("apikey",{});renderSettings()};
@@ -8522,7 +8703,111 @@ function restorePick(parts,src,name){const box=$("#bkRestore");if(!box)return;
       if(r.restart){toast("Restoring. VODgrab is restarting…");const t0=Date.now();const wait=async()=>{try{await api("status");if(Date.now()-t0>4000){location.reload();return}}catch(e){}setTimeout(wait,1500)};setTimeout(wait,3000)}
       else{toast("Settings and providers restored");renderSettings()}}catch(e){toast(e.message,1)}}}
 
-refreshStatus().then(()=>route());
+/* ---------------- first-time setup wizard */
+// Every request here has a time limit, and Back, Skip and Next always work, so no step can hang the wizard.
+async function apiT(p,body,ms){const c=new AbortController(),t=setTimeout(()=>c.abort(),ms||30000);
+  try{const o=body===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)};o.signal=c.signal;
+    const r=await fetch("/api/"+p,o);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||r.statusText);return j}
+  catch(e){if(e.name=="AbortError")throw new Error(`No answer after ${Math.round((ms||30000)/1000)} seconds`);throw e}
+  finally{clearTimeout(t)}}
+const WSTEPS=[["welcome","Welcome"],["provider","Provider"],["arrs","Sonarr and Radarr"],["folders","Folders"],["extras","Extras"],["done","Finish"]];
+let WZ=null;
+function openWizard(){WZ={i:0,seq:0,done:{},prov:{name:"",url:"",username:"",password:"",max_conn:1,id:null},arr:{sonarr:{url:"",key:""},radarr:{url:"",key:""}},res:{},set:{base_path:"",release_group:"",tmdb_key:"",web_username:"",web_password:""},timer:null};
+  $("#wiz").classList.add("on");wzDraw();
+  apiT("settings",undefined,15000).then(r=>{if(!WZ)return;const s=r.settings;WZ.folders=r.folders;
+    for(const a of ["sonarr","radarr"]){WZ.arr[a].orig=s[a+"_url"]||"";if(!WZ.arr[a].url)WZ.arr[a].url=WZ.arr[a].orig}
+    if(!WZ.set.base_path)WZ.set.base_path=s.base_path||"";if(!WZ.set.release_group)WZ.set.release_group=s.release_group||"";
+    if(!WZ.set.web_username)WZ.set.web_username=s.web_username||"";wzDraw()}).catch(()=>{});
+  WZ.timer=setInterval(()=>{if(WZ&&!document.hidden)refreshStatus().then(()=>{const e=$("#wzSync");if(e)e.textContent=wzSyncTxt()})},4000)}
+function closeWizard(mark){if(!WZ)return;clearInterval(WZ.timer);WZ=null;$("#wiz").classList.remove("on");$("#wiz").innerHTML="";
+  if(mark)apiT("settings",{wizard_done:true},15000).catch(()=>{}).then(()=>refreshStatus());
+  if(tab=="settings")renderSettings();else if(tab=="browse")load(true)}
+const wzSyncTxt=()=>!status||!status.sync?"":status.sync.running?"Loading the catalog in the background: "+(status.sync.phase||"starting")+". You can carry on.":status.counts&&(status.counts.movies||status.counts.series)?`Catalog loaded: ${status.counts.movies.toLocaleString()} movies and ${status.counts.series.toLocaleString()} series.`:status.sync.error?"Catalog sync failed: "+status.sync.error:"";
+function wzKeep(){// remember what is typed before any redraw
+  $$("#wiz [data-w]").forEach(el=>{const [g,k,k2]=el.dataset.w.split(".");if(k2)WZ[g][k][k2]=el.value;else WZ[g][k]=el.value})}
+function wzLines(key){const r=WZ.res[key]||[];return `<div class="res" id="wzr_${key}">${r.map(x=>`<div class="${x[0]}">${x[0]=="ok"?"✓ ":x[0]=="bad"?"✗ ":x[0]=="warn"?"! ":"… "}${esc(x[1])}</div>`).join("")}</div>`}
+function wzSay(key,lines){if(!WZ)return;WZ.res[key]=lines;const el=$("#wzr_"+key);if(el)el.outerHTML=wzLines(key)}
+function wzGo(d){wzKeep();WZ.seq++;WZ.i=Math.max(0,Math.min(WSTEPS.length-1,WZ.i+d));wzDraw();$("#wiz").scrollTop=0}
+function wzDraw(){if(!WZ)return;const [id]=WSTEPS[WZ.i],fi=(w,label,val,type,ph,hint)=>`<div class="f"><label>${label}</label><input data-w="${w}" type="${type||"text"}" value="${esc(val||"")}" placeholder="${esc(ph||"")}" autocomplete="${type=="password"?"new-password":"off"}">${hint?`<div class="hint">${hint}</div>`:""}</div>`;
+  let h="";
+  if(id=="welcome")h=`<h2>Welcome to VODgrab</h2><p>This short setup connects your IPTV provider and, if you use them, Sonarr and Radarr. It takes a few minutes. Every step can be skipped, and everything here can be changed later in Settings.</p>
+    <p>You will need: your provider's server address, username and password. For Sonarr and Radarr: their address and API key (in each app under Settings, General).</p>`;
+  if(id=="provider")h=`<h2>Your IPTV provider</h2><p>The Xtream login your provider gave you. VODgrab tests it, then loads the provider's movie and series list in the background.</p>
+    <div class="fields">${fi("prov.name","Name",WZ.prov.name,"text","For example My provider")}${fi("prov.url","Server address",WZ.prov.url,"text","http://host:port")}
+    ${fi("prov.username","Username",WZ.prov.username)}${fi("prov.password","Password",WZ.prov.password,"password")}
+    ${fi("prov.max_conn","Connections VODgrab may use",WZ.prov.max_conn,"number","1","How many streams your account allows at once. Leave 1 if unsure.")}</div>
+    <div class="nav" style="margin-top:12px"><button class="btn p" id="wzProv">Test and save</button></div>${wzLines("prov")}<div class="res"><div class="wait" id="wzSync">${esc(wzSyncTxt())}</div></div>
+    <p style="margin-top:14px">Using Dispatcharr instead? Skip this step and connect it under Settings, Dispatcharr.</p>`;
+  if(id=="arrs")h=`<h2>Sonarr and Radarr</h2><p>Optional. Connecting them lets VODgrab act as their indexer and download client, and import what you download. <b>Connect</b> tests the address and key, sets VODgrab up inside the app, and checks that the app can see VODgrab's download folders.</p>
+    ${["sonarr","radarr"].map(a=>{const L=a=="sonarr"?"Sonarr":"Radarr";return `<div class="box"><b>${L}</b><div class="fields" style="margin-top:8px">${fi(`arr.${a}.url`,"Address",WZ.arr[a].url,"text","http://192.168.1.10:"+(a=="sonarr"?"8989":"7878"))}${fi(`arr.${a}.key`,"API key",WZ.arr[a].key,"password",WZ.done[a]?"Saved":"","In "+L+": Settings, General, API Key")}</div>
+      <div class="nav" style="margin-top:10px"><button class="btn p" data-wzarr="${a}">Connect ${L}</button></div>${wzLines(a)}</div>`}).join("")}`;
+  if(id=="folders")h=`<h2>Download folder</h2><p>Where VODgrab saves files. Sonarr and Radarr must be able to open the same folder at the same path, or they cannot import. In Docker that means mapping the same host folder to the same path in all three containers.</p>
+    <div class="fields">${fi("set.base_path","Download folder",WZ.set.base_path,"text","/downloads/iptv")}${fi("set.release_group","Release group (optional)",WZ.set.release_group,"text","For example VODgrab","Shown as the release group in Sonarr and Radarr. Letters and digits only.")}</div>
+    <div class="nav" style="margin-top:12px"><button class="btn" id="wzFold">Save and check folders</button></div>${wzLines("fold")}`;
+  if(id=="extras")h=`<h2>Extras</h2><p>Both optional.</p>
+    <div class="box"><b>Posters, cast and better matching</b><p>A free TMDB API key adds artwork, age ratings and trailers, and helps match titles to the right movie or show. Get one at themoviedb.org under Settings, API.</p>
+      <div class="fields">${fi("set.tmdb_key","TMDB API key",WZ.set.tmdb_key,"password")}</div><div class="nav" style="margin-top:10px"><button class="btn" id="wzTmdb">Save and test</button></div>${wzLines("tmdb")}</div>
+    <div class="box"><b>Password for this page</b><p>Without one, anyone on your network who can open this address can use VODgrab. Your browser will ask for the login right after you save it.</p>
+      <div class="fields">${fi("set.web_username","Username",WZ.set.web_username)}${fi("set.web_password","Password",WZ.set.web_password,"password")}</div><div class="nav" style="margin-top:10px"><button class="btn" id="wzLogin">Save login</button></div>${wzLines("login")}</div>`;
+  if(id=="done"){const row=(ok,t)=>`<div class="${ok?"ok":"wait"}">${ok?"✓":"–"} ${t}</div>`;
+    h=`<h2>All set</h2><p>Here is what was set up. Anything skipped can be done later in Settings, where you can also run this wizard again.</p>
+    <div class="res">${row(WZ.done.prov,WZ.done.prov?"Provider connected":"No provider yet (VODgrab has nothing to show until you add one)")}${row(WZ.done.sonarr,WZ.done.sonarr?"Sonarr connected":"Sonarr not connected")}${row(WZ.done.radarr,WZ.done.radarr?"Radarr connected":"Radarr not connected")}${row(WZ.done.fold,WZ.done.fold?"Download folder saved":"Download folder left as it was")}${row(WZ.done.tmdb,WZ.done.tmdb?"TMDB key saved":"No TMDB key")}${row(WZ.done.login,WZ.done.login?"Page password set":"No page password")}</div>
+    <div class="res"><div class="wait" id="wzSync">${esc(wzSyncTxt())}</div></div>`}
+  const last=WZ.i==WSTEPS.length-1;
+  $("#wiz").innerHTML=`<div class="wz"><div class="steps">${WSTEPS.map((x,i)=>`<span class="${i==WZ.i?"on":i<WZ.i?"done":""}">${i+1}. ${x[1]}</span>`).join("")}</div>${h}
+    <div class="nav">${WZ.i?`<button class="btn" id="wzBack">Back</button>`:""}<span class="sp"></span>${last?"":`<button class="btn" id="wzQuit">Skip setup</button>`}
+    ${WZ.i&&!last?`<button class="btn" id="wzSkip">Skip this step</button>`:""}<button class="btn p" id="wzNext">${last?"Finish":WZ.i?"Next":"Start"}</button></div></div>`;
+  if($("#wzBack"))$("#wzBack").onclick=()=>wzGo(-1);
+  if($("#wzSkip"))$("#wzSkip").onclick=()=>wzGo(1);
+  if($("#wzQuit"))$("#wzQuit").onclick=()=>{if(confirm("Skip the setup? You can do everything in Settings, and run this wizard again from there."))closeWizard(true)};
+  $("#wzNext").onclick=()=>last?closeWizard(true):wzGo(1);
+  const run=(btn,fn)=>{if(btn)btn.onclick=async()=>{wzKeep();const seq=WZ.seq;btn.disabled=true;try{await fn(()=>WZ&&WZ.seq==seq)}finally{if(btn.isConnected)btn.disabled=false}}};
+  run($("#wzProv"),wzProvider);$$("[data-wzarr]").forEach(b=>run(b,live=>wzArr(b.dataset.wzarr,live)));
+  run($("#wzFold"),wzFolders);run($("#wzTmdb"),wzTmdb);run($("#wzLogin"),wzLogin)}
+async function wzProvider(live){const p=WZ.prov;if(!p.url.trim()||!p.username.trim()){wzSay("prov",[["bad","Enter the server address and username first."]]);return}
+  wzSay("prov",[["wait","Saving and testing the login (up to 30 seconds)…"]]);
+  try{const r=await apiT("providers",{id:p.id,name:p.name.trim()||"My provider",url:p.url,username:p.username,password:p.password,max_conn:p.max_conn,enabled:true},20000);
+    if(!WZ)return;p.id=r.id;
+    const t=await apiT("test/provider/"+p.id,undefined,30000);if(!WZ)return;
+    if(!t.ok){wzSay("prov",[["bad",t.message||"The provider rejected the login."],["wait","Check the details and press Test and save again."]]);return}
+    WZ.done.prov=true;const L=[["ok",`Login works${t.status?" (account "+t.status+")":""}${t.expires?", expires "+t.expires:""}.`]];
+    if(t.max_connections&&+t.max_connections>+p.max_conn)L.push(["wait",`This account allows ${t.max_connections} connections. You can raise the number above and save again.`]);
+    try{await apiT("sync",{},15000);L.push(["ok","Catalog loading started."])}catch(e){L.push(["warn","Could not start the catalog sync: "+e.message+". Use Sync now in Settings."])}
+    wzSay("prov",L);refreshStatus().then(()=>{const e=$("#wzSync");if(e)e.textContent=wzSyncTxt()})}
+  catch(e){wzSay("prov",[["bad",e.message],["wait","Nothing is stuck: fix the details and try again, or skip this step."]])}}
+async function wzArr(a,live){const L=a=="sonarr"?"Sonarr":"Radarr",v=WZ.arr[a],out=[];
+  if(!v.url.trim()||(!v.key.trim()&&!WZ.done[a])){wzSay(a,[["bad","Enter the address and API key first."]]);return}
+  const say=x=>{out.push(x);wzSay(a,out.concat([["wait","Working…"]]))};wzSay(a,[["wait","Testing the connection (up to 20 seconds)…"]]);
+  try{const b={};b[a+"_url"]=v.url.trim();if(v.key.trim())b[a+"_api_key"]=v.key.trim();await apiT("settings",b,15000);
+    const t=await apiT("test/"+a,undefined,20000);say(["ok",t.message||L+" reachable"]);if(WZ)WZ.done[a]=true}
+  catch(e){// don't leave an address that doesn't work saved as if the app were connected
+    if(WZ&&!WZ.done[a]){const b={};b[a+"_url"]=v.orig||"";apiT("settings",b,15000).catch(()=>{})}
+    wzSay(a,[["bad","Could not reach "+L+": "+e.message],["wait","Check the address and API key, then press Connect again."]]);return}
+  try{const r=await apiT("setup/"+a,{external_url:location.origin},60000);say(["ok",r.message||"VODgrab set up in "+L])}
+  catch(e){say(["warn","Automatic setup did not finish: "+e.message+". You can run it later in Settings."])}
+  try{const r=await apiT("foldercheck/"+a,undefined,40000);wzFoldLines(r).forEach(x=>out.push(x))}
+  catch(e){out.push(["warn","Could not check the folders: "+e.message])}
+  wzSay(a,out)}
+const wzFoldLines=r=>r.folders.map(f=>f.state=="ok"?["ok",`${r.arr} can see ${f.folder}`]:f.state=="missing"?["warn",`${r.arr} does not seem to see ${f.folder}. It needs the same folder at the same path, or imports will fail.`]:f.state=="error"?["bad",`${f.folder}: ${f.detail}`]:["wait",`Could not check ${f.folder}${f.detail?" ("+f.detail+")":""}`]);
+async function wzFolders(){const b={release_group:WZ.set.release_group.trim()};if(WZ.set.base_path.trim())b.base_path=WZ.set.base_path.trim();
+  wzSay("fold",[["wait","Saving…"]]);const out=[];
+  try{const r=await apiT("settings",b,15000);if(!WZ)return;WZ.done.fold=true;WZ.set.release_group=r.settings.release_group||"";out.push(["ok","Saved. Downloads go under "+r.settings.base_path])}
+  catch(e){wzSay("fold",[["bad",e.message]]);return}
+  for(const a of ["sonarr","radarr"])if(WZ.done[a]||(status.arrs&&status.arrs[a])){wzSay("fold",out.concat([["wait","Checking what "+(a=="sonarr"?"Sonarr":"Radarr")+" can see…"]]));
+    try{wzFoldLines(await apiT("foldercheck/"+a,undefined,40000)).forEach(x=>out.push(x))}catch(e){out.push(["warn","Could not check with "+a+": "+e.message])}}
+  wzSay("fold",out)}
+async function wzTmdb(){if(!WZ.set.tmdb_key.trim()){wzSay("tmdb",[["bad","Paste the key first."]]);return}
+  wzSay("tmdb",[["wait","Saving and testing (up to 30 seconds)…"]]);
+  try{await apiT("settings",{tmdb_key:WZ.set.tmdb_key.trim()},15000);const r=await apiT("meta/test",{},30000);if(!WZ)return;
+    if(r.TMDB=="OK"){WZ.done.tmdb=true;wzSay("tmdb",[["ok","TMDB key works."]])}else wzSay("tmdb",[["bad","TMDB answered: "+(r.TMDB||"no answer")]])}
+  catch(e){wzSay("tmdb",[["bad",e.message]])}}
+async function wzLogin(){const u=WZ.set.web_username.trim(),pw=WZ.set.web_password;
+  if(!u||!pw){wzSay("login",[["bad","Enter both a username and a password."]]);return}
+  wzSay("login",[["wait","Saving…"]]);
+  try{await apiT("settings",{web_username:u,web_password:pw},15000);if(!WZ)return;WZ.done.login=true;wzSay("login",[["ok","Saved. Your browser will ask for this login."]])}
+  catch(e){wzSay("login",[["bad",e.message]])}}
+
+refreshStatus().then(()=>{route();if(status&&status.wizard)openWizard()});
 </script>
 </body>
 </html>
