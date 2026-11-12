@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -79,6 +79,7 @@ DEFAULTS = {
     "radarr_link_url": "",
     "release_group": "",
     "wizard_done": False,
+    "length_skip": [],
     "sonarr_link_url": "",
     "radarr_root": "",
     "radarr_profile_id": 0,
@@ -3120,16 +3121,44 @@ class ImportRefused(Exception):
     """VODgrab will not hand the file to Radarr or Sonarr (the movie or episode already has a file)."""
 
 
+class LengthRefused(ImportRefused):
+    """The file's length looks wrong for the movie or episode. Only a guess, so History offers Import anyway."""
+
+
+def episode_runtime_tmdb(ser, series_id, season, episode):
+    """Minutes TMDB lists for one episode (0 when unknown or there is no TMDB key). ser: Sonarr's series."""
+    try:
+        tmdb = to_int(ser.get("tmdbId"))
+        if not tmdb:
+            lib = q1("SELECT tmdb FROM arr_lib WHERE kind='series' AND arr_id=?", series_id)
+            tmdb = lib["tmdb"] if lib else None
+        if not tmdb or season is None or episode is None:
+            return 0
+        eps = season_meta(int(tmdb), int(season), "Ended" if ser.get("ended") else "") or []
+        return next((to_int(e.get("r")) or 0 for e in eps if e.get("e") == episode), 0)
+    except Exception as e:
+        log("TMDB episode runtime lookup failed: %s" % mask(str(e)), "warn")
+        return 0
+
+
+def length_skipped(meta, key):
+    """True when you pressed Import anyway for this download, or said not to check this movie or show."""
+    return bool(meta.get("skip_length")) or key in (S().get("length_skip") or [])
+
+
 def check_length(j, meta, runtime, title, what):
     """A movie far shorter or longer than Radarr's runtime is a trailer, a placeholder or another title."""
     mm = re.search(r"(\d+) min", str(meta.get("probe") or ""))
     run = to_int(runtime) or 0
-    if not mm or run < 5:
+    if not mm or run < 5 or length_skipped(meta, "radarr:%s" % meta.get("arr_movie")):
         return
     got = int(mm.group(1))
     if got < run * 0.5 or got > run * 2.2:
-        raise ImportRefused("This file is %d min but Radarr says %s runs %d min, so it is probably a trailer, a "
-                            "placeholder or a different %s. Try another provider's copy." % (got, title, run, what))
+        e = LengthRefused("This file is %d min but Radarr says %s runs %d min, so it is probably a trailer, a "
+                          "placeholder or a different %s. Try another provider's copy, or press Import anyway "
+                          "if the file is right." % (got, title, run, what))
+        e.key = "radarr:%s" % meta.get("arr_movie")
+        raise e
 
 
 class Limited(Exception):
@@ -3680,6 +3709,11 @@ class Engine:
             upd(jid, status="import_failed", error=reason)
             log("Import failed for %s: %s" % (j["release"], reason), "warn")
         except ImportRefused as e:
+            if isinstance(e, LengthRefused):
+                m2 = jmeta(job(jid))
+                m2["length_refused"] = True
+                m2["length_key"] = getattr(e, "key", "")
+                upd(jid, meta=json.dumps(m2))
             upd(jid, status="import_failed", error=str(e))
             log("Import failed for %s: %s" % (j["release"], e), "warn")
         except ArrError as e:
@@ -3704,7 +3738,7 @@ class Engine:
             if not mv.get("id"):
                 return None
             out = {"movie": mv["id"], "what": mv.get("title") or "this movie", "prov": j["prov"]}
-            check_length(j, meta, mv.get("runtime"), mv.get("title") or "this movie", "movie")
+            check_length(j, dict(meta, arr_movie=mv["id"]), mv.get("runtime"), mv.get("title") or "this movie", "movie")
             if mv.get("hasFile"):
                 out["have"] = ((mv.get("movieFile") or {}).get("quality") or {}).get("quality") or {}
             return out
@@ -3729,17 +3763,28 @@ class Engine:
         # A file far shorter or longer than the show's episodes is most likely another show with the same name,
         # linked by mistake; importing it by ID would put it in the wrong show.
         mm = re.search(r"(\d+) min", str(meta.get("probe") or ""))
-        if mm:
-            try:
-                ser = arr.get("/api/v3/series/%s" % out["series"]) or {}
-            except ArrError:
-                ser = {}
-            run, got = to_int(ser.get("runtime")) or 0, int(mm.group(1))
-            if run >= 5 and got and (got < run * 0.5 or got > run * 2.2):
-                raise ImportRefused(
-                    "This file is %d min but Sonarr's %s runs about %d min an episode, so it is probably a different "
-                    "show with the same name. Check the link in the show's details (Not this show)." % (
-                        got, ser.get("title") or "show", run))
+        if mm and not length_skipped(meta, "sonarr:%s" % out["series"]):
+            # Compare with this episode's own runtime when Sonarr has one: a show's single runtime is wrong for
+            # shows whose episode length changed over the years (4-minute early seasons of a 10-minute show).
+            run, got, title, own, who = to_int(ep.get("runtime")) or 0, int(mm.group(1)), "", True, "Sonarr"
+            if run < 2:
+                try:
+                    ser = arr.get("/api/v3/series/%s" % out["series"]) or {}
+                except ArrError:
+                    ser = {}
+                run = episode_runtime_tmdb(ser, out["series"], meta["season"], meta.get("ep"))  # needs a TMDB key
+                who = "TMDB"
+                if run < 2:
+                    own, who = False, "Sonarr"
+                    run, title = to_int(ser.get("runtime")) or 0, ser.get("title") or ""
+            if run >= (2 if own else 5) and got and (got < run * 0.5 - 1 or got > run * 2.2 + 1):
+                e = LengthRefused(
+                    "This file is %d min but %s says %s runs about %d min, so it may be a different show with the "
+                    "same name. If the file is right, press Import anyway. If the show is wrong, open its details "
+                    "and press Not this show." % (got, who, "this episode" if own else
+                                                  "an episode of %s" % (title or "the show"), run))
+                e.key = "sonarr:%s" % out["series"]
+                raise e
         if ep.get("hasFile"):
             out["have"] = {}
             if ep.get("episodeFileId"):
@@ -3926,6 +3971,20 @@ def job_action(jid, action):
             upd(jid, pos=other["pos"])
             upd(other["id"], pos=j["pos"])
         return {"ok": True}
+    if action in ("force", "forceall"):
+        # Import anyway: the length check was only a guess. forceall also stops checking this movie or show.
+        if j["status"] != "import_failed":
+            raise ValueError("Only a failed import can be imported anyway")
+        meta = jmeta(j)
+        meta["skip_length"] = True
+        meta.pop("length_refused", None)
+        if action == "forceall":
+            key = meta.get("length_key") or ""
+            if key and not key.endswith(":None"):
+                save_settings({"length_skip": sorted(set(S().get("length_skip") or []) | {key})})
+        upd(jid, status="importing", error="", meta=json.dumps(meta))
+        threading.Thread(target=ENGINE._import, args=(jid,), daemon=True).start()
+        return {"ok": True, "message": "Importing without the length check"}
     if action == "retry":
         if j["status"] == "import_failed":
             upd(jid, status="importing", error="")
@@ -6486,6 +6545,7 @@ def job_row(j):
     d["probe"] = meta.get("probe")
     d["provider"] = pname(j["prov"]) if j["prov"] else ""
     d["sources"] = len(job_sources(j))
+    d["length_refused"] = bool(meta.get("length_refused")) and j["status"] == "import_failed"
     d["arr_url"] = job_arr_page(j) if j["status"] in ("failed", "import_failed", "imported", "completed") else None
     pr = ENGINE.progress.get(j["id"])
     if pr:
@@ -8407,8 +8467,12 @@ async function renderHistory(){
     <div class="sub"><span class="tag">${j.source=="arr"?esc(j.arr):"Manual"}</span>${j.provider?`<span class="tag">${esc(j.provider)}</span>`:""}${st(j.status)} ${j.total?fb(j.total)+" · ":""}${j.probe?esc(j.probe)+" · ":""}${ago(j.updated)}</div>
     ${j.error?`<div class="sub" style="color:${["failed","import_failed"].includes(j.status)?"var(--bad)":"var(--dim)"}">${esc(j.error)}</div>`:""}
     <div class="sub">${esc(j.release)}</div></div>
-    <div class="acts">${j.arr_url?`<a class="btn s" href="${esc(j.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in ${j.kind=="movie"?"Radarr":"Sonarr"}</a>`:""}${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
+    <div class="acts">${j.length_refused?`<button class="btn s p" data-force="${j.id}">Import anyway</button>`:""}${j.arr_url?`<a class="btn s" href="${esc(j.arr_url)}" target="_blank" rel="noopener" style="text-decoration:none">Open in ${j.kind=="movie"?"Radarr":"Sonarr"}</a>`:""}${["failed","import_failed","cancelled"].includes(j.status)?`<button class="btn s" data-a="retry" data-id="${j.id}">${j.status=="import_failed"?"Retry import":"Retry"}</button>`:""}
     <button class="btn s d" data-a="delete" data-id="${j.id}">${j.status=="import_failed"?"Delete file":"Remove"}</button></div></div>`).join("")}</div>`:`<div class="empty">No history yet.</div>`);
+  $$("[data-force]",m).forEach(b=>b.onclick=async()=>{const j=rows.find(x=>x.id==b.dataset.force),w=j&&j.kind=="movie"?"movie":"show";
+    if(!confirm("Import this file even though its length looks wrong?\n\nOnly do this if you are sure it is the right "+(w=="movie"?"movie":"episode")+"."))return;
+    const all=confirm(`Also stop checking the length for this ${w} from now on?\n\nOK: never check this ${w} again.\nCancel: import just this file.`);
+    try{const r=await api(`job/${b.dataset.force}/${all?"forceall":"force"}`,{});toast(r.message);renderHistory();refreshStatus()}catch(e){toast(e.message,1)}});
   if($("#retryAll"))$("#retryAll").onclick=async e=>{
     if(!confirm(`Retry the ${nr} failed download${nr==1?"":"s"} and import${nr==1?"":"s"}?\n\nEach release is retried once. Failed imports are handed to Radarr/Sonarr again, failed manual downloads go back in the queue, and for failed Radarr/Sonarr grabs VODgrab asks them to search again.`))return;
     e.target.disabled=true;

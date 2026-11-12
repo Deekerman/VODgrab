@@ -2,6 +2,11 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.17.1 (2026-11-12)
+
+- **Fixed: right episodes refused as "a different show".** The length check compared every episode with the show's single runtime in Sonarr, so shows whose episode length changed over the years (the 4 to 5 minute early seasons of *Thomas the Tank Engine*, listed at 10 minutes) had correct files refused. It now compares with that episode's own runtime: Sonarr's when it has one, otherwise TMDB's (needs your TMDB key), and only then the show's runtime.
+- **Import anyway.** A download refused because of its length now has an **Import anyway** button in History. It then asks whether to stop checking the length for that movie or show from now on. The check is a guess, so it can no longer block you.
+
 ## 1.17.0 (2026-11-10)
 
 - **Setup wizard for new installs.** A fresh VODgrab now opens a short wizard: add your provider (the login is tested and the catalog starts loading), connect Sonarr and Radarr (tested, set up automatically, and checked that they can see VODgrab's download folders), pick the download folder and release group, and optionally add a TMDB key and a page password. Every step can be skipped, every test has a time limit, and Back, Skip and Next always work, so it can't get stuck. Existing installs don't see it; **Settings → Catalog sync → Run setup wizard** opens it any time.
