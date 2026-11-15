@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.17.1"
+VERSION = "1.17.2"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -259,7 +259,7 @@ CREATE TABLE IF NOT EXISTS series(id INTEGER PRIMARY KEY, prov INTEGER, name TEX
   missing INTEGER DEFAULT 0, eps_fetched REAL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS series_norm ON series(norm);
 CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY, prov INTEGER, series_id INTEGER, season INTEGER,
-  episode INTEGER, title TEXT, ext TEXT, added INTEGER);
+  episode INTEGER, title TEXT, ext TEXT, added INTEGER, aired TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS ep_series ON episodes(series_id, season, episode);
 CREATE TABLE IF NOT EXISTS vodinfo(id INTEGER PRIMARY KEY, data TEXT, fetched REAL);
 """
@@ -334,6 +334,9 @@ def init_db():
                 ex("ALTER TABLE %s ADD COLUMN %s %s" % (t, col, typ))
                 ex("DELETE FROM vodinfo")
                 ex("UPDATE series SET eps_fetched=0")
+    if "aired" not in {r["name"] for r in q("PRAGMA table_info(episodes)")}:  # air date, for daily shows
+        ex("ALTER TABLE episodes ADD COLUMN aired TEXT DEFAULT ''")
+        ex("UPDATE series SET eps_fetched=0")
     ex("CREATE TABLE IF NOT EXISTS probes(id INTEGER PRIMARY KEY, width INTEGER, height INTEGER, vcodec TEXT, "
        "duration INTEGER, bitrate INTEGER, size INTEGER, at REAL)")
     have = {r["name"] for r in q("PRAGMA table_info(probes)")}
@@ -1924,6 +1927,29 @@ def sync_summary(r):
         r["movies"], r["added_movies"], r["removed_movies"], r["series"], r["added_series"], r["removed_series"])
 
 
+def iso_date(v):
+    """'2010-01-15' from whatever a provider or Sonarr sends as a date; '' when there is none."""
+    mm = re.search(r"(?<!\d)((?:19|20)\d{2})-(\d{1,2})-(\d{1,2})(?!\d)", str(v or ""))
+    return "%s-%02d-%02d" % (mm.group(1), int(mm.group(2)), int(mm.group(3))) if mm else ""
+
+
+def title_has_date(title, date):
+    """True when an episode title names this air date: 2010-01-15, 2010.01.15, 15/01/2010, 15.01.10, 15th January 2010."""
+    t = str(title or "").lower()
+    if not t or not date:
+        return False
+    y, m, d = date.split("-")
+    mm_, dd_ = "0?" + m.lstrip("0"), "0?" + d.lstrip("0")
+    for parts in ((y, mm_, dd_), (dd_, mm_, y), (dd_, mm_, y[2:])):
+        if re.search(r"(?<!\d)%s[-./ ]%s[-./ ]%s(?!\d)" % parts, t):
+            return True
+    mon = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+           "november", "december")[int(m) - 1]
+    dd = d.lstrip("0")
+    return bool(re.search(r"(?<!\d)0?%s(?:st|nd|rd|th)?\s+%s\w*\.?,?\s+%s(?!\d)" % (dd, mon[:3], y), t) or
+                re.search(r"\b%s\w*\.?\s+0?%s(?:st|nd|rd|th)?,?\s+%s(?!\d)" % (mon[:3], dd, y), t))
+
+
 def ensure_episodes(sid, max_age=12 * 3600):
     with _ep_locks[sid]:
         r = q1("SELECT eps_fetched FROM series WHERE id=?", sid)
@@ -1958,9 +1984,12 @@ def ensure_episodes(sid, max_age=12 * 3600):
             md = media_of(e.get("info"))
             info_ = e.get("info") if isinstance(e.get("info"), dict) else {}
             title = episode_name(e.get("title") or info_.get("name") or "", show, season, num)
+            aired = iso_date(info_.get("releasedate") or info_.get("release_date") or info_.get("air_date")
+                             or e.get("air_date") or e.get("releasedate"))
             rows.append((enc(pid, eid), pid, sid, season, num, title,
                          (e.get("container_extension") or "mkv").strip(".") or "mkv", to_int(e.get("added")) or 0,
-                         md.get("width"), md.get("height"), md.get("vcodec"), md.get("duration"), md.get("bitrate")))
+                         md.get("width"), md.get("height"), md.get("vcodec"), md.get("duration"), md.get("bitrate"),
+                         aired))
         info = data.get("info") or {}
         if not isinstance(info, dict):
             info = {}
@@ -1970,7 +1999,7 @@ def ensure_episodes(sid, max_age=12 * 3600):
         try:
             c.execute("DELETE FROM episodes WHERE series_id=?", (sid,))
             c.executemany("INSERT OR REPLACE INTO episodes(id, prov, series_id, season, episode, title, ext, added, "
-                          "width, height, vcodec, duration, bitrate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                          "width, height, vcodec, duration, bitrate, aired) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             c.execute("UPDATE series SET eps_fetched=?, tmdb=COALESCE(tmdb, ?), plot=CASE WHEN plot='' "
                       "THEN ? ELSE plot END WHERE id=?", (time.time(), tmdb, info.get("plot") or "", sid))
             c.execute("COMMIT")
@@ -2836,8 +2865,10 @@ def movie_release(title, year, name, row=None):
     return with_group([title, year, quality_for(row, name)], row)
 
 
-def episode_release(title, season, episode, name, row=None):
-    return with_group([title, "S%02dE%02d" % (season, episode), quality_for(row, name)], row)
+def episode_release(title, season, episode, name, row=None, date=None):
+    """date: a daily show found by air date is named by that date (Show.2010.01.15), which is how Sonarr matches it."""
+    num = date.replace("-", ".") if date else "S%02dE%02d" % (season, episode)
+    return with_group([title, num, quality_for(row, name)], row)
 
 
 def found_tmdb(kind, work):
@@ -4041,12 +4072,12 @@ def est_size(kind, quality):
     return int(gb * GB if kind == "movie" else gb * GB / 3)
 
 
-def ep_item(srow, e, title, tvdb=None, src=None):
+def ep_item(srow, e, title, tvdb=None, src=None, date=None):
     qual = quality_for(e, srow["name"])
     size = media_view(e)["size"]
     return {"kind": "episode", "xid": e["id"], "ext": e["ext"], "arr": "sonarr",
-            "title": episode_release(title, e["season"], e["episode"], srow["name"], e),
-            "label": ep_label(title, e),
+            "title": episode_release(title, e["season"], e["episode"], srow["name"], e, date),
+            "label": ep_label(title, e) + (" (%s)" % date if date else ""),
             "pub": e["added"] or srow["modified"] or time.time(), "cat": cat_for("episode", qual),
             "size": size or est_size("episode", qual), "tvdb": to_int(tvdb), "season": e["season"],
             "ep": e["episode"], "src": src or [[e["id"], e["ext"]]]}
@@ -4090,14 +4121,59 @@ def split_by_quality(pairs, name_of):
     return sorted(out.items(), key=lambda kv: order.get(kv[0], 9))
 
 
-def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True):
-    """One release per episode and real quality, with every provider's copy of that quality as a source."""
+_daily_memo = {}
+
+
+def sonarr_air_dates(series_id):
+    """{air date: [(season, episode)]} and {season: highest episode} for a Sonarr series. Kept ten minutes: a daily
+    show has thousands of episodes and Sonarr searches them one date at a time."""
+    hit = _daily_memo.get(series_id)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1], hit[2]
+    dates, tops = {}, {}
+    for x in SONARR.get("/api/v3/episode", seriesId=series_id) or []:
+        sn, en = to_int(x.get("seasonNumber")), to_int(x.get("episodeNumber"))
+        if sn is None or en is None:
+            continue
+        tops[sn] = max(tops.get(sn, 0), en)
+        d = iso_date(x.get("airDate"))
+        if d:
+            dates.setdefault(d, []).append((sn, en))
+    if len(_daily_memo) > 50:
+        _daily_memo.clear()
+    _daily_memo[series_id] = (time.time(), dates, tops)
+    return dates, tops
+
+
+def daily_pick(sid, date, nums, tops):
+    """A provider's episodes that aired on this date. Its own air date or a date in the title decides. Without
+    either, Sonarr's season and episode numbers for that date are used, but only when the provider numbers the
+    season the way Sonarr does (a provider that restarts at S01E01 every year would otherwise hand over the wrong
+    episode)."""
+    eps = episodes_for(sid, None, None)
+    dated = [e for e in eps if (e["aired"] or "") == date or title_has_date(e["title"], date)]
+    if dated:
+        return dated
+    top = {}
+    for e in eps:
+        top[e["season"]] = max(top.get(e["season"], 0), e["episode"])
+    return [e for e in eps if (e["season"], e["episode"]) in nums and not e["aired"]
+            and top.get(e["season"], 0) <= tops.get(e["season"], 0)]
+
+
+def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True, daily=None):
+    """One release per episode and real quality, with every provider's copy of that quality as a source.
+    daily: (air date, Sonarr's (season, episode) numbers for it, Sonarr's highest episode per season)."""
     groups = collections.OrderedDict()
     for sid in sorted(sids, key=prio):
         if ENGINE.is_down(dec(sid)[0]):  # Sonarr can't grab what a down provider can't send
             continue
         srow = q1("SELECT * FROM series WHERE id=?", sid)
         if not srow:
+            continue
+        if daily:
+            for e in daily_pick(sid, *daily):
+                groups.setdefault((0, 0), []).append((srow, e))
             continue
         for e in episodes_for(sid, season, ep):
             groups.setdefault((e["season"], e["episode"]), []).append((srow, e))
@@ -4108,7 +4184,8 @@ def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True):
         srows = {e["id"]: srow for srow, e in groups[key]}
         for qual, rows in split_by_quality([(e, srow["name"]) for srow, e in groups[key]], None):
             srow = srows[rows[0]["id"]]
-            items.append(ep_item(srow, rows[0], title_fn(srow), tvdb, [[r["id"], r["ext"]] for r in rows]))
+            items.append(ep_item(srow, rows[0], title_fn(srow), tvdb, [[r["id"], r["ext"]] for r in rows],
+                                 daily[0] if daily else None))
     return items
 
 
@@ -4136,18 +4213,40 @@ def grouped_movies(ids, title_fn, check=True):
     return items
 
 
+def search_date(qs):
+    """Sonarr searches daily shows (soaps, talk shows, news) by air date: season=2010&ep=01/15."""
+    mm = re.match(r"^\s*(\d{1,2})/(\d{1,2})\s*$", str(qs.get("ep") or ""))
+    y = to_int(qs.get("season"))
+    if mm and y and 1900 < y < 2200 and 1 <= int(mm.group(1)) <= 12 and 1 <= int(mm.group(2)) <= 31:
+        return "%04d-%02d-%02d" % (y, int(mm.group(1)), int(mm.group(2)))
+    return None
+
+
 def tv_search(qs):
     season, ep = to_int(qs.get("season")), to_int(qs.get("ep"))
     tvdb = to_int(qs.get("tvdbid"))
+    date = search_date(qs)
     if tvdb:
         ids, info = match("sonarr", tvdb, lambda: sonarr_series_by_tvdb(tvdb))
-        return grouped_episodes(ids, season, ep, lambda srow: (info or {}).get("title") or srow["clean"], tvdb)
+        daily = None
+        if date:
+            dates, tops = {}, {}
+            try:
+                ser = sonarr_series_by_tvdb(tvdb) or {}
+                if ser.get("id"):
+                    dates, tops = sonarr_air_dates(ser["id"])
+            except ArrError:
+                pass
+            daily = (date, set(dates.get(date) or []), tops)
+        return grouped_episodes(ids, season, ep, lambda srow: (info or {}).get("title") or srow["clean"], tvdb,
+                                daily=daily)
     term = (qs.get("q") or "").strip()
     if term:
         ids, _, _ = find_catalog("series", [term], None, None)
         if ids:
             ids = sorted(set(ids) | set(equivalents("series", ids[0])), key=prio)
-        return grouped_episodes(ids, season, ep, lambda srow: srow["clean"])
+        return grouped_episodes(ids, season, ep, lambda srow: srow["clean"],
+                                daily=(date, set(), {}) if date else None)
     items = []
     for srow in q("SELECT * FROM series WHERE %s%s ORDER BY modified DESC LIMIT 10" % (live(), not_down())):
         eps = episodes_for(srow["id"], None, None)
@@ -4283,7 +4382,32 @@ def import_check(jid, now=False):
         reason or "no reason given; check %s's Activity page" % arr.label), "warn")
 
 
+def gone_checks():
+    """A finished download whose file has left the download folder is no longer offered to Radarr or Sonarr. While
+    it stays in the list they retry the missing path every minute ("path does not exist") and keep it stuck in
+    their queue. The file is gone because it was imported without a webhook, imported by hand, or deleted."""
+    for j in q("SELECT * FROM jobs WHERE source='arr' AND hidden=0 AND status='completed' AND path<>'' AND "
+               "meta NOT LIKE '%\"gone\"%'"):
+        d = os.path.dirname(j["path"])
+        if os.path.exists(j["path"]) or not os.path.isdir(os.path.dirname(d)):  # folder offline: not "gone"
+            continue
+        meta = jmeta(j)
+        if not meta.get("gone_at"):
+            meta["gone_at"] = time.time()
+        elif time.time() - meta["gone_at"] >= 540:
+            meta["gone"] = True
+            log("%s is no longer in the download folder (imported or removed), so %s is no longer offered it" % (
+                j["release"], (j["arr"] or "the arr").title()))
+        else:
+            continue
+        ex("UPDATE jobs SET meta=? WHERE id=?", json.dumps(meta), j["id"])
+
+
 def import_checks():
+    try:
+        gone_checks()
+    except Exception as e:
+        log("Checking finished downloads failed: %s" % e, "warn")
     cutoff = time.time() - 30 * 60
     for r in q("SELECT id FROM jobs WHERE source='arr' AND hidden=0 AND status='completed' AND finished<? AND "
                "finished>? AND meta NOT LIKE '%import_checked%'", cutoff, time.time() - 14 * 86400):
@@ -4337,6 +4461,8 @@ def sab_history(cat, limit, start=0):
     seen = {j["id"] for j in rows}
     rows += [j for j in q("SELECT * FROM jobs WHERE %s AND status='completed' AND finished>? ORDER BY updated DESC"
                           % where, *(args + [time.time() - 14 * 86400])) if j["id"] not in seen]
+    # ...but not once the file has left the download folder: the arr would retry a missing path every minute.
+    rows = [j for j in rows if not (j["status"] == "completed" and '"gone"' in (j["meta"] or ""))]
     slots = []
     for j in rows:
         ok = j["status"] in ("completed", "imported")

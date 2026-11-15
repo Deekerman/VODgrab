@@ -2,6 +2,11 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.17.2 (2026-11-15)
+
+- **Daily shows can be found (Coronation Street, soaps, talk shows).** Sonarr searches these by air date instead of season and episode, and VODgrab answered every such search with nothing. It now finds the episode for that date: by the air date your provider lists, by a date in the episode's title, or by Sonarr's season and episode numbers for that date. The numbers are only trusted when the provider numbers the season the way Sonarr does, so a provider that restarts at S01E01 every year doesn't hand over the wrong episode. Episode lists are reloaded once after this update to pick up air dates.
+- **Fixed: Sonarr or Radarr logging "path does not exist" every minute.** A finished download whose file had left the download folder (imported by hand, or deleted) stayed in the list VODgrab gives Sonarr and Radarr, so they retried the missing file forever and kept it stuck in their queue. Ten minutes after the file is gone, VODgrab stops offering it. Nothing changes while the download folder itself is offline.
+
 ## 1.17.1 (2026-11-12)
 
 - **Fixed: right episodes refused as "a different show".** The length check compared every episode with the show's single runtime in Sonarr, so shows whose episode length changed over the years (the 4 to 5 minute early seasons of *Thomas the Tank Engine*, listed at 10 minutes) had correct files refused. It now compares with that episode's own runtime: Sonarr's when it has one, otherwise TMDB's (needs your TMDB key), and only then the show's runtime.
