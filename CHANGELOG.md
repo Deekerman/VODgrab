@@ -2,6 +2,10 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.17.3 (2026-11-15)
+
+- **Fixed: two episodes on the same day (Coronation Street's "Part 1" and "Part 2").** A date search returned one release for the day and treated the second episode as a spare copy of the first, so you couldn't tell which part it was and Sonarr couldn't either. Each episode is now its own release with its part in the name (`Coronation.Street.2010.01.01.Part.2…`), which Sonarr matches to the right episode. Days with one episode are unchanged.
+
 ## 1.17.2 (2026-11-15)
 
 - **Daily shows can be found (Coronation Street, soaps, talk shows).** Sonarr searches these by air date instead of season and episode, and VODgrab answered every such search with nothing. It now finds the episode for that date: by the air date your provider lists, by a date in the episode's title, or by Sonarr's season and episode numbers for that date. The numbers are only trusted when the provider numbers the season the way Sonarr does, so a provider that restarts at S01E01 every year doesn't hand over the wrong episode. Episode lists are reloaded once after this update to pick up air dates.

@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.17.2"
+VERSION = "1.17.3"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -2865,9 +2865,10 @@ def movie_release(title, year, name, row=None):
     return with_group([title, year, quality_for(row, name)], row)
 
 
-def episode_release(title, season, episode, name, row=None, date=None):
-    """date: a daily show found by air date is named by that date (Show.2010.01.15), which is how Sonarr matches it."""
-    num = date.replace("-", ".") if date else "S%02dE%02d" % (season, episode)
+def episode_release(title, season, episode, name, row=None, date=None, part=None):
+    """date: a daily show found by air date is named by that date (Show.2010.01.15), which is how Sonarr matches it.
+    part: which of that day's episodes it is, when there are several (Show.2010.01.15.Part.2)."""
+    num = (date.replace("-", ".") + (".Part.%d" % part if part else "")) if date else "S%02dE%02d" % (season, episode)
     return with_group([title, num, quality_for(row, name)], row)
 
 
@@ -4072,12 +4073,12 @@ def est_size(kind, quality):
     return int(gb * GB if kind == "movie" else gb * GB / 3)
 
 
-def ep_item(srow, e, title, tvdb=None, src=None, date=None):
+def ep_item(srow, e, title, tvdb=None, src=None, date=None, part=None):
     qual = quality_for(e, srow["name"])
     size = media_view(e)["size"]
     return {"kind": "episode", "xid": e["id"], "ext": e["ext"], "arr": "sonarr",
-            "title": episode_release(title, e["season"], e["episode"], srow["name"], e, date),
-            "label": ep_label(title, e) + (" (%s)" % date if date else ""),
+            "title": episode_release(title, e["season"], e["episode"], srow["name"], e, date, part),
+            "label": ep_label(title, e) + (" (%s%s)" % (date, ", part %d" % part if part else "") if date else ""),
             "pub": e["added"] or srow["modified"] or time.time(), "cat": cat_for("episode", qual),
             "size": size or est_size("episode", qual), "tvdb": to_int(tvdb), "season": e["season"],
             "ep": e["episode"], "src": src or [[e["id"], e["ext"]]]}
@@ -4139,6 +4140,9 @@ def sonarr_air_dates(series_id):
         d = iso_date(x.get("airDate"))
         if d:
             dates.setdefault(d, []).append((sn, en))
+    for d, lst in dates.items():  # like Sonarr: a special sharing the date doesn't count as one of the day's parts
+        if any(sn for sn, _ in lst):
+            dates[d] = [x for x in lst if x[0]]
     if len(_daily_memo) > 50:
         _daily_memo.clear()
     _daily_memo[series_id] = (time.time(), dates, tops)
@@ -4151,20 +4155,31 @@ def daily_pick(sid, date, nums, tops):
     season the way Sonarr does (a provider that restarts at S01E01 every year would otherwise hand over the wrong
     episode)."""
     eps = episodes_for(sid, None, None)
+    order = sorted(nums)
     dated = [e for e in eps if (e["aired"] or "") == date or title_has_date(e["title"], date)]
-    if dated:
-        return dated
-    top = {}
-    for e in eps:
-        top[e["season"]] = max(top.get(e["season"], 0), e["episode"])
-    return [e for e in eps if (e["season"], e["episode"]) in nums and not e["aired"]
-            and top.get(e["season"], 0) <= tops.get(e["season"], 0)]
+    if not dated:
+        top = {}
+        for e in eps:
+            top[e["season"]] = max(top.get(e["season"], 0), e["episode"])
+        dated = [e for e in eps if (e["season"], e["episode"]) in nums and not e["aired"]
+                 and top.get(e["season"], 0) <= tops.get(e["season"], 0)]
+    # Two episodes on one day (a soap's double bill): each needs its part number, or Sonarr can't tell them apart.
+    if len(order) < 2 and (order or len(dated) < 2):
+        return [(e, 0) for e in dated[:1]] if order else [(e, 0) for e in dated]
+    out = []
+    for i, e in enumerate(dated):
+        mm = re.search(r"\bpart[ ._-]?(\d)\b", e["title"] or "", re.I)
+        key = (e["season"], e["episode"])
+        part = order.index(key) + 1 if key in nums else int(mm.group(1)) if mm else i + 1
+        if part and (not order or part <= len(order)):
+            out.append((e, part))
+    return out
 
 
 def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True, daily=None):
     """One release per episode and real quality, with every provider's copy of that quality as a source.
     daily: (air date, Sonarr's (season, episode) numbers for it, Sonarr's highest episode per season)."""
-    groups = collections.OrderedDict()
+    groups, parts = collections.OrderedDict(), {}
     for sid in sorted(sids, key=prio):
         if ENGINE.is_down(dec(sid)[0]):  # Sonarr can't grab what a down provider can't send
             continue
@@ -4172,8 +4187,9 @@ def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True, daily=No
         if not srow:
             continue
         if daily:
-            for e in daily_pick(sid, *daily):
-                groups.setdefault((0, 0), []).append((srow, e))
+            for e, part in daily_pick(sid, *daily):
+                parts[e["id"]] = part
+                groups.setdefault((0, part), []).append((srow, e))
             continue
         for e in episodes_for(sid, season, ep):
             groups.setdefault((e["season"], e["episode"]), []).append((srow, e))
@@ -4185,7 +4201,7 @@ def grouped_episodes(sids, season, ep, title_fn, tvdb=None, check=True, daily=No
         for qual, rows in split_by_quality([(e, srow["name"]) for srow, e in groups[key]], None):
             srow = srows[rows[0]["id"]]
             items.append(ep_item(srow, rows[0], title_fn(srow), tvdb, [[r["id"], r["ext"]] for r in rows],
-                                 daily[0] if daily else None))
+                                 daily[0] if daily else None, parts.get(rows[0]["id"])))
     return items
 
 
