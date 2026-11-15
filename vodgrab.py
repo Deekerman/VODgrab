@@ -39,7 +39,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xesc, quoteattr
 
-VERSION = "1.17.3"
+VERSION = "1.18.0"
 SCALE = 10 ** 10  # catalog ids are provider_id * SCALE + provider stream id
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("VODGRAB_DATA", os.path.join(HERE, "data"))
@@ -259,7 +259,7 @@ CREATE TABLE IF NOT EXISTS series(id INTEGER PRIMARY KEY, prov INTEGER, name TEX
   missing INTEGER DEFAULT 0, eps_fetched REAL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS series_norm ON series(norm);
 CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY, prov INTEGER, series_id INTEGER, season INTEGER,
-  episode INTEGER, title TEXT, ext TEXT, added INTEGER, aired TEXT DEFAULT '');
+  episode INTEGER, title TEXT, ext TEXT, added INTEGER, aired TEXT DEFAULT '', listed TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS ep_series ON episodes(series_id, season, episode);
 CREATE TABLE IF NOT EXISTS vodinfo(id INTEGER PRIMARY KEY, data TEXT, fetched REAL);
 """
@@ -334,9 +334,13 @@ def init_db():
                 ex("ALTER TABLE %s ADD COLUMN %s %s" % (t, col, typ))
                 ex("DELETE FROM vodinfo")
                 ex("UPDATE series SET eps_fetched=0")
-    if "aired" not in {r["name"] for r in q("PRAGMA table_info(episodes)")}:  # air date, for daily shows
-        ex("ALTER TABLE episodes ADD COLUMN aired TEXT DEFAULT ''")
-        ex("UPDATE series SET eps_fetched=0")
+    have = {r["name"] for r in q("PRAGMA table_info(episodes)")}
+    for col in ("aired", "listed"):  # air date (daily shows); where the provider listed a renumbered episode
+        if col not in have:
+            ex("ALTER TABLE episodes ADD COLUMN %s TEXT DEFAULT ''" % col)
+            ex("UPDATE series SET eps_fetched=0")
+    ex("CREATE TABLE IF NOT EXISTS epmap(id INTEGER PRIMARY KEY, series_id INTEGER, season INTEGER, episode INTEGER)")
+    ex("CREATE INDEX IF NOT EXISTS epmap_series ON epmap(series_id)")
     ex("CREATE TABLE IF NOT EXISTS probes(id INTEGER PRIMARY KEY, width INTEGER, height INTEGER, vcodec TEXT, "
        "duration INTEGER, bitrate INTEGER, size INTEGER, at REAL)")
     have = {r["name"] for r in q("PRAGMA table_info(probes)")}
@@ -1950,6 +1954,119 @@ def title_has_date(title, date):
                 re.search(r"\b%s\w*\.?\s+0?%s(?:st|nd|rd|th)?,?\s+%s(?!\d)" % (mon[:3], dd, y), t))
 
 
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def title_dates(title):
+    """Every date an episode title could be naming, as ISO strings. Numeric dates like 04/01/2010 can be read
+    day-first or month-first, so both are returned; the caller keeps the one the show really aired on."""
+    t = str(title or "").lower()
+    out = set()
+
+    def add(y, m, d):
+        y, m, d = int(y), int(m), int(d)
+        if y < 100:
+            y += 2000 if y < 50 else 1900
+        if 1900 < y < 2200 and 1 <= m <= 12 and 1 <= d <= 31:
+            out.add("%04d-%02d-%02d" % (y, m, d))
+    for mm in re.finditer(r"(?<!\d)((?:19|20)\d{2})[-./ ](\d{1,2})[-./ ](\d{1,2})(?!\d)", t):
+        add(*mm.groups())
+    for mm in re.finditer(r"(?<!\d)(\d{1,2})[-./](\d{1,2})[-./](\d{4}|\d{2})(?!\d)", t):
+        a, b, y = mm.groups()
+        add(y, b, a)
+        add(y, a, b)
+    mon = r"(%s)[a-z]*\.?" % "|".join(_MONTHS)
+    for mm in re.finditer(r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+%s,?\s+((?:19|20)\d{2})(?!\d)" % mon, t):
+        add(mm.group(3), _MONTHS.index(mm.group(2)) + 1, mm.group(1))
+    for mm in re.finditer(r"\b%s\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+((?:19|20)\d{2})(?!\d)" % mon, t):
+        add(mm.group(3), _MONTHS.index(mm.group(1)) + 1, mm.group(2))
+    return out
+
+
+def show_dates(sid):
+    """{air date: [(season, episode), ...]} for a show, in the numbering VODgrab should use: Sonarr's when the show is
+    in Sonarr (Wanted, downloads and imports need it), otherwise TMDB's. None when neither can be asked."""
+    try:
+        links = arr_links("series", sid) if SONARR.ok() else []
+    except Exception:
+        links = []
+    if links:
+        try:
+            return sonarr_air_dates(links[0]["arr_id"])[0]
+        except ArrError as e:
+            log("Episode dates from Sonarr failed: %s" % e, "warn")
+    row = q1("SELECT work FROM series WHERE id=?", sid)
+    if not row or not S().get("tmdb_key"):
+        return None
+    mt, d = ensure_meta("series", row["work"], True)
+    nums = [x["n"] for x in (d or {}).get("seasons") or [] if x.get("n") and x.get("eps")]
+    if not mt or not nums:
+        return None
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        got = list(pool.map(lambda n: (n, season_meta(mt, n, d.get("status")) or []), nums))
+    dates = {}
+    for n, eps in got:
+        for e in eps:
+            day = iso_date(e.get("d"))
+            if day and e.get("e") is not None:
+                dates.setdefault(day, []).append((n, e["e"]))
+    return dates
+
+
+def renumber(sid, rows):
+    """Seasons a provider numbers its own way (Season 2024 for a show whose 2024 episodes are season 65, or a season
+    whose episode numbers don't match the air dates) are renumbered by air date: the provider's air date, or a date in
+    the episode title ("Fri Jan 01 2010 Part 1"). rows: [(id, season, episode, title, aired)].
+    Returns {id: (season, episode)} for the episodes that move."""
+    dates = show_dates(sid)
+    if not dates:
+        return None
+    for d in dates:
+        dates[d] = sorted(set(dates[d]))
+    by_num = {sn_ep: d for d, lst in dates.items() for sn_ep in lst}
+    real = {sn for lst in dates.values() for sn, _ in lst}
+
+    def day_of(r):
+        if r[4] and r[4] in dates:
+            return r[4]
+        hits = [d for d in title_dates(r[3]) if d in dates]
+        return hits[0] if len(hits) == 1 else None
+    seasons = collections.defaultdict(list)
+    for r in rows:
+        seasons[r[1]].append(r)
+    odd = []
+    for sn, lst in seasons.items():
+        if sn == 0:
+            continue
+        if sn not in real:
+            odd.append(sn)
+            continue
+        dated = [(r, day_of(r)) for r in lst]
+        dated = [(r, d) for r, d in dated if d]
+        wrong = sum(1 for r, d in dated if by_num.get((r[1], r[2])) != d)
+        if len(dated) >= 3 and wrong * 2 > len(dated):
+            odd.append(sn)
+    if not odd:
+        return {}
+    taken = {(r[1], r[2]) for r in rows if r[1] not in odd}
+    moves = {}
+    for sn in sorted(odd):
+        same_day = collections.defaultdict(list)
+        for r in sorted(seasons[sn], key=lambda r: r[2]):
+            d = day_of(r)
+            if d:
+                same_day[d].append(r)
+        for d, lst in same_day.items():
+            slots = dates[d]
+            for i, r in enumerate(lst):
+                mm = re.search(r"\bpart[ ._-]?(\d)\b", r[3] or "", re.I)
+                k = int(mm.group(1)) - 1 if mm and len(slots) > 1 else i
+                if 0 <= k < len(slots) and slots[k] not in taken:
+                    taken.add(slots[k])
+                    moves[r[0]] = slots[k]
+    return moves
+
+
 def ensure_episodes(sid, max_age=12 * 3600):
     with _ep_locks[sid]:
         r = q1("SELECT eps_fetched FROM series WHERE id=?", sid)
@@ -1994,12 +2111,25 @@ def ensure_episodes(sid, max_age=12 * 3600):
         if not isinstance(info, dict):
             info = {}
         tmdb = to_int(info.get("tmdb") or info.get("tmdb_id")) or None
+        moves = None
+        try:
+            moves = renumber(sid, [(r[0], r[3], r[4], r[5], r[13]) for r in rows])
+        except Exception as e:
+            log("Matching episodes of %s by air date failed: %s" % (show, mask(str(e))), "warn")
+        if moves is None:  # Sonarr and TMDB can't be asked now: keep the last matching
+            moves = {r["id"]: (r["season"], r["episode"]) for r in q("SELECT * FROM epmap WHERE series_id=?", sid)}
+        else:
+            ex("DELETE FROM epmap WHERE series_id=?", sid)
+            for i, (a, b) in moves.items():
+                ex("INSERT OR REPLACE INTO epmap(id, series_id, season, episode) VALUES(?,?,?,?)", i, sid, a, b)
+        rows = [r[:3] + moves[r[0]] + r[5:] + ("S%02dE%02d" % (r[3], r[4]),) if r[0] in moves else r + ("",)
+                for r in rows]
         c = db()
         c.execute("BEGIN")
         try:
             c.execute("DELETE FROM episodes WHERE series_id=?", (sid,))
             c.executemany("INSERT OR REPLACE INTO episodes(id, prov, series_id, season, episode, title, ext, added, "
-                          "width, height, vcodec, duration, bitrate, aired) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                          "width, height, vcodec, duration, bitrate, aired, listed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             c.execute("UPDATE series SET eps_fetched=?, tmdb=COALESCE(tmdb, ?), plot=CASE WHEN plot='' "
                       "THEN ? ELSE plot END WHERE id=?", (time.time(), tmdb, info.get("plot") or "", sid))
             c.execute("COMMIT")
@@ -8454,7 +8584,7 @@ async function openSeries(id){
   const epHtml=e=>{const n=`E${String(e.episode).padStart(2,"0")}`,t=e.tname||e.title||("Episode "+e.episode);
     const meta=[e.air?fmtDate(e.air):"",e.runtime?e.runtime+"m":""].filter(Boolean).join(" · ");
     return `<div class="ep2${e.missing?" na":""}"><div class="still" ${e.still?`style="background-image:url('${esc(e.still)}')"`:""}>${e.still?"":n}</div>
-      <div class="eb"><div class="eh"><span class="en">${n}</span><span class="et">${esc(t)}</span>${e.wanted?`<span class="lb lb3">Wanted</span>`:""}${meta?`<span class="em">${esc(meta)}</span>`:""}</div>
+      <div class="eb"><div class="eh"><span class="en">${n}</span><span class="et">${esc(t)}</span>${e.listed?`<span class="muted" style="font-size:12px" title="Your provider lists this episode under another number; VODgrab matched it by its air date">listed as ${esc(e.listed)}</span>`:""}${e.wanted?`<span class="lb lb3">Wanted</span>`:""}${meta?`<span class="em">${esc(meta)}</span>`:""}</div>
       ${e.overview?`<div class="eo" title="Click to expand">${esc(e.overview)}</div>`:""}
       <div class="ea">${e.missing?`<span class="muted" style="font-size:12px">Not on your providers</span>`:`<span title="${esc(qinfo(e.media)+(e.media.file_title?" · In the file: "+e.media.file_title:""))}">${e.checking?`<span class="q unk checking" title="Checking quality">…</span>`:qb(e.media)}</span>${e.media.missing?`<span style="color:var(--bad);font-size:12px">Missing on the provider</span>`:""}${e.media.known?`<span class="em">${esc([e.media.codec,dur(e.media.duration),e.media.size?fb(e.media.size):""].filter(Boolean).join(" · "))}</span>`:""}${e.job?st(e.job):""}
         ${e.media.known||e.checking?"":`<button class="btn s" data-c="${e.id}">Check quality</button>`}<button class="btn s" data-pl="${e.id}">▶ Play</button><button class="btn s p" data-e="${e.id}">Download</button>`}</div></div></div>`};

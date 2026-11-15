@@ -2,6 +2,13 @@
 
 VODgrab reads this file to show release notes under **Settings → Updates**.
 
+## 1.18.0 (2026-11-15)
+
+- **Shows a provider numbers its own way are matched by air date.** Some providers list episodes under seasons named after years (Coronation Street's "Season 2024" instead of season 65), or with episode numbers that don't match the real ones. Those episodes found no details (no name, description, air date or picture), couldn't show **Wanted**, and their **Download** couldn't tell Sonarr which episode the file was. VODgrab now notices a season that doesn't line up and matches each of its episodes by its air date: the date the provider lists, or a date in the episode's title ("Fri Jan 01 2010 Part 1"). Two episodes on one day are told apart by "Part 1" and "Part 2". Matched episodes move to their real season and number, show "listed as S2024E05" so you can still find them, and work everywhere: details, Wanted, Download and Sonarr's searches.
+  - The real numbering comes from Sonarr when the show is in Sonarr, otherwise from TMDB (needs your TMDB key).
+  - An episode with no date anywhere stays where the provider put it, and so does one whose real episode the provider already lists elsewhere.
+  - Each show's episode list reloads the next time it is opened or searched, which picks this up. The first time, a long-running show can take a few seconds longer to open while every season's dates are loaded.
+
 ## 1.17.3 (2026-11-15)
 
 - **Fixed: two episodes on the same day (Coronation Street's "Part 1" and "Part 2").** A date search returned one release for the day and treated the second episode as a spare copy of the first, so you couldn't tell which part it was and Sonarr couldn't either. Each episode is now its own release with its part in the name (`Coronation.Street.2010.01.01.Part.2…`), which Sonarr matches to the right episode. Days with one episode are unchanged.
